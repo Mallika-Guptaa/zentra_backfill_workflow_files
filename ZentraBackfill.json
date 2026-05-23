@@ -25,14 +25,14 @@
       "UseSecretStore": true,
       "ActionRepoName": "FaaSr-workflow",
       "Branch": "main",
-      "UserName": "REPLACE_WITH_YOUR_GITHUB_USERNAME"
+      "UserName": "Mallika-Guptaa"
     }
   },
   "DataStores": {
     "S3": {
-      "Endpoint": "REPLACE_WITH_YOUR_S3_ENDPOINT",
-      "Bucket": "REPLACE_WITH_YOUR_BUCKET_NAME",
-      "Region": "REPLACE_WITH_YOUR_REGION"
+      "Endpoint": "https://s3.us-east-005.backblazeb2.com",
+      "Bucket": "1check",
+      "Region":  "us-east-005"
     }
   },
   "ActionContainers": {
@@ -41,7 +41,7 @@
   "FunctionInvoke": "BackfillZentraHistory",
   "DefaultDataStore": "S3",
   "FunctionGitRepo": {
-    "backfill_zentra_history": "REPLACE_WITH_YOUR_GITHUB_USERNAME/FaaSr-Zentra/python"
+    "backfill_zentra_history": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
   },
   "PyPIPackageDownloads": {
     "backfill_zentra_history": [
