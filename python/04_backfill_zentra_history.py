@@ -235,3 +235,15 @@ def backfill_zentra_history(
     _upload_json(progress, state_folder, progress_file)
     faasr_log(f"Backfill run finished. done_all_devices={done_all}, calls_used={calls_used}")
     return summary
+
+def finish_backfill():
+    """
+    Small terminal function used only to avoid a single-node FaaSr DAG.
+
+    The real work is done in backfill_zentra_history().
+    This function lets the workflow be:
+        BackfillZentraHistory -> FinishBackfill
+    """
+    faasr_log("Zentra backfill workflow finished.")
+    return "done"
+
