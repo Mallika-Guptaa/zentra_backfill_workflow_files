@@ -234,16 +234,14 @@ def backfill_zentra_history(
     _upload_json(summary, state_folder, "zentra_backfill_last_run_summary.json")
     _upload_json(progress, state_folder, progress_file)
     faasr_log(f"Backfill run finished. done_all_devices={done_all}, calls_used={calls_used}")
-    return summary
+    # Do not return the summary object to FaaSr. It is already saved to S3.
+    # Returning a dict can cause FaaSr RPC /faasr-return 422 errors.
+
 
 def finish_backfill():
     """
-    Small terminal function used only to avoid a single-node FaaSr DAG.
-
-    The real work is done in backfill_zentra_history().
-    This function lets the workflow be:
-        BackfillZentraHistory -> FinishBackfill
+    Terminal function used only to avoid a single-node FaaSr DAG.
+    The actual work is done in backfill_zentra_history().
     """
     faasr_log("Zentra backfill workflow finished.")
-    return "done"
 
