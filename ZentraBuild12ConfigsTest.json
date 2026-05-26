@@ -1,0 +1,83 @@
+{
+  "ActionList": {
+    "ReadZentraRawFiles": {
+      "Arguments": {
+        "raw_prefix": "zentra_raw_phase2_test",
+        "staging_prefix": "zentra_phase2_test_staging",
+        "max_files_per_serial": "ALL"
+      },
+      "InvokeNext": [
+        "Form12ConfigCSVs"
+      ],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "read_zentra_raw_files"
+    },
+    "Form12ConfigCSVs": {
+      "Arguments": {
+        "staging_prefix": "zentra_phase2_test_staging",
+        "generated_prefix": "zentra_phase2_test_staging/generated_12_configs"
+      },
+      "InvokeNext": [
+        "Upload12ConfigCSVs"
+      ],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "form_12_config_csvs"
+    },
+    "Upload12ConfigCSVs": {
+      "Arguments": {
+        "generated_prefix": "zentra_phase2_test_staging/generated_12_configs",
+        "output_prefix": "zentra_final_12_configs_test",
+        "staging_prefix": "zentra_phase2_test_staging"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "upload_12_config_csvs"
+    }
+  },
+  "ComputeServers": {
+    "GH": {
+      "FaaSType": "GitHubActions",
+      "UseSecretStore": true,
+      "ActionRepoName": "FaaSr-workflow",
+      "Branch": "main",
+      "UserName": "Mallika-Guptaa"
+    }
+  },
+  "DataStores": {
+    "S3": {
+      "Endpoint": "https://s3.us-east-005.backblazeb2.com",
+      "Bucket": "1check",
+      "Region": "us-east-005"
+    }
+  },
+  "ActionContainers": {
+    "ReadZentraRawFiles": "ghcr.io/faasr/github-actions-python:latest",
+    "Form12ConfigCSVs": "ghcr.io/faasr/github-actions-python:latest",
+    "Upload12ConfigCSVs": "ghcr.io/faasr/github-actions-python:latest"
+  },
+  "FunctionInvoke": "ReadZentraRawFiles",
+  "DefaultDataStore": "S3",
+  "FunctionGitRepo": {
+    "read_zentra_raw_files": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "form_12_config_csvs": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "upload_12_config_csvs": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
+  },
+  "PyPIPackageDownloads": {
+    "read_zentra_raw_files": [
+      "pandas"
+    ],
+    "form_12_config_csvs": [
+      "pandas"
+    ],
+    "upload_12_config_csvs": [
+      "pandas"
+    ]
+  },
+  "Secrets": [],
+  "FaaSrLog": "FaaSrLog",
+  "LoggingDataStore": "S3",
+  "WorkflowName": "ZentraBuild12ConfigsTest"
+}
