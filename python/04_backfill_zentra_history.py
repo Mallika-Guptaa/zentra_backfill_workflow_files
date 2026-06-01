@@ -238,10 +238,20 @@ def backfill_zentra_history(
     # Returning a dict can cause FaaSr RPC /faasr-return 422 errors.
 
 
+
+def initialize_parallel_backfill():
+    """
+    Start node for the parallel Zentra historical backfill workflow.
+
+    This function does not fetch data. It only creates a clean root node
+    for the FaaSr DAG before fan-out to the 13 logger-specific backfill actions.
+    """
+    faasr_log("Starting parallel Zentra historical backfill across logger serial numbers.")
+
+
 def finish_backfill():
     """
     Terminal function used only to avoid a single-node FaaSr DAG.
     The actual work is done in backfill_zentra_history().
     """
     faasr_log("Zentra backfill workflow finished.")
-
