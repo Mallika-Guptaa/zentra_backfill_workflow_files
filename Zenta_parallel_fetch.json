@@ -1,0 +1,331 @@
+{
+  "ActionList": {
+    "StartParallelBackfill": {
+      "Arguments": {},
+      "InvokeNext": [
+        "Backfill_z6_19600",
+        "Backfill_z6_12196",
+        "Backfill_z6_19602",
+        "Backfill_z6_19604",
+        "Backfill_z6_19597",
+        "Backfill_z6_19594",
+        "Backfill_z6_19599",
+        "Backfill_z6_12197",
+        "Backfill_z6_19595",
+        "Backfill_z6_19598",
+        "Backfill_z6_12202",
+        "Backfill_z6_19596",
+        "Backfill_z6_19603"
+      ],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "finish_backfill"
+    },
+
+    "Backfill_z6_19600": {
+      "Arguments": {
+        "serial_numbers": "z6-19600",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19600.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_12196": {
+      "Arguments": {
+        "serial_numbers": "z6-12196",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-12196.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19602": {
+      "Arguments": {
+        "serial_numbers": "z6-19602",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19602.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19604": {
+      "Arguments": {
+        "serial_numbers": "z6-19604",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19604.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19597": {
+      "Arguments": {
+        "serial_numbers": "z6-19597",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19597.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19594": {
+      "Arguments": {
+        "serial_numbers": "z6-19594",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19594.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19599": {
+      "Arguments": {
+        "serial_numbers": "z6-19599",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19599.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_12197": {
+      "Arguments": {
+        "serial_numbers": "z6-12197",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-12197.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19595": {
+      "Arguments": {
+        "serial_numbers": "z6-19595",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19595.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19598": {
+      "Arguments": {
+        "serial_numbers": "z6-19598",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19598.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_12202": {
+      "Arguments": {
+        "serial_numbers": "z6-12202",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-12202.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19596": {
+      "Arguments": {
+        "serial_numbers": "z6-19596",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19596.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    },
+
+    "Backfill_z6_19603": {
+      "Arguments": {
+        "serial_numbers": "z6-19603",
+        "start_date": "2024-04-04 00:00:00",
+        "end_date": "",
+        "chunk_days": 1,
+        "per_page": 2000,
+        "max_api_calls_per_run": 5,
+        "sleep_seconds": 65,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "progress_file": "zentra_backfill_progress_z6-19603.json"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "backfill_zentra_history"
+    }
+  },
+
+  "ComputeServers": {
+    "GH": {
+      "FaaSType": "GitHubActions",
+      "UseSecretStore": true,
+      "ActionRepoName": "FaaSr-workflow",
+      "Branch": "main",
+      "UserName": "Mallika-Guptaa"
+    }
+  },
+
+  "DataStores": {
+    "S3": {
+      "Endpoint": "https://s3.us-east-005.backblazeb2.com",
+      "Bucket": "1check",
+      "Region": "us-east-005"
+    }
+  },
+
+  "ActionContainers": {
+    "StartParallelBackfill": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19600": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_12196": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19602": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19604": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19597": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19594": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19599": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_12197": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19595": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19598": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_12202": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19596": "ghcr.io/faasr/github-actions-python:latest",
+    "Backfill_z6_19603": "ghcr.io/faasr/github-actions-python:latest"
+  },
+
+  "FunctionInvoke": "StartParallelBackfill",
+  "DefaultDataStore": "S3",
+
+  "FunctionGitRepo": {
+    "finish_backfill": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "backfill_zentra_history": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
+  },
+
+  "PyPIPackageDownloads": {
+    "finish_backfill": [],
+    "backfill_zentra_history": [
+      "pandas",
+      "requests"
+    ]
+  },
+
+  "Secrets": [
+    "ZENTRA_TOKEN"
+  ],
+
+  "FaaSrLog": "FaaSrLog",
+  "LoggingDataStore": "S3",
+  "WorkflowName": "ZentraParallelBackfill"
+}
