@@ -19,9 +19,8 @@
       ],
       "FaaSServer": "GH",
       "Type": "Python",
-      "FunctionName": "finish_backfill"
+      "FunctionName": "initialize_parallel_backfill"
     },
-
     "Backfill_z6_19600": {
       "Arguments": {
         "serial_numbers": "z6-19600",
@@ -40,7 +39,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_12196": {
       "Arguments": {
         "serial_numbers": "z6-12196",
@@ -59,7 +57,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19602": {
       "Arguments": {
         "serial_numbers": "z6-19602",
@@ -78,7 +75,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19604": {
       "Arguments": {
         "serial_numbers": "z6-19604",
@@ -97,7 +93,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19597": {
       "Arguments": {
         "serial_numbers": "z6-19597",
@@ -116,7 +111,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19594": {
       "Arguments": {
         "serial_numbers": "z6-19594",
@@ -135,7 +129,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19599": {
       "Arguments": {
         "serial_numbers": "z6-19599",
@@ -154,7 +147,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_12197": {
       "Arguments": {
         "serial_numbers": "z6-12197",
@@ -173,7 +165,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19595": {
       "Arguments": {
         "serial_numbers": "z6-19595",
@@ -192,7 +183,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19598": {
       "Arguments": {
         "serial_numbers": "z6-19598",
@@ -211,7 +201,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_12202": {
       "Arguments": {
         "serial_numbers": "z6-12202",
@@ -230,7 +219,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19596": {
       "Arguments": {
         "serial_numbers": "z6-19596",
@@ -249,7 +237,6 @@
       "Type": "Python",
       "FunctionName": "backfill_zentra_history"
     },
-
     "Backfill_z6_19603": {
       "Arguments": {
         "serial_numbers": "z6-19603",
@@ -269,7 +256,6 @@
       "FunctionName": "backfill_zentra_history"
     }
   },
-
   "ComputeServers": {
     "GH": {
       "FaaSType": "GitHubActions",
@@ -279,7 +265,6 @@
       "UserName": "Mallika-Guptaa"
     }
   },
-
   "DataStores": {
     "S3": {
       "Endpoint": "https://s3.us-east-005.backblazeb2.com",
@@ -287,7 +272,6 @@
       "Region": "us-east-005"
     }
   },
-
   "ActionContainers": {
     "StartParallelBackfill": "ghcr.io/faasr/github-actions-python:latest",
     "Backfill_z6_19600": "ghcr.io/faasr/github-actions-python:latest",
@@ -304,27 +288,22 @@
     "Backfill_z6_19596": "ghcr.io/faasr/github-actions-python:latest",
     "Backfill_z6_19603": "ghcr.io/faasr/github-actions-python:latest"
   },
-
   "FunctionInvoke": "StartParallelBackfill",
   "DefaultDataStore": "S3",
-
   "FunctionGitRepo": {
-    "finish_backfill": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "initialize_parallel_backfill": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
     "backfill_zentra_history": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
   },
-
   "PyPIPackageDownloads": {
-    "finish_backfill": [],
+    "initialize_parallel_backfill": [],
     "backfill_zentra_history": [
       "pandas",
       "requests"
     ]
   },
-
   "Secrets": [
     "ZENTRA_TOKEN"
   ],
-
   "FaaSrLog": "FaaSrLog",
   "LoggingDataStore": "S3",
   "WorkflowName": "ZentraParallelBackfill"
