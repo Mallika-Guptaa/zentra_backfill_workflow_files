@@ -13,11 +13,32 @@ from FaaSr_py.client.py_client_stubs import (
     faasr_secret,
 )
 
+# Logger serials used in the Orchardgrass trial.
 DEFAULT_SERIAL_NUMBERS = [
     "z6-19600", "z6-12196", "z6-19602", "z6-19604", "z6-19597",
     "z6-19594", "z6-19599", "z6-12197", "z6-19595", "z6-19598",
     "z6-12202", "z6-19596", "z6-19603",
 ]
+
+# Ports that are actually needed according to the Orchardgrass Trial Information document.
+# The public Zentra get_readings API is queried by logger serial number; this code filters
+# the returned rows to these ports before saving to S3.
+LOGGER_PORTS = {
+    "z6-19600": [2, 4, 5],          # NEWAg #7
+    "z6-12196": [3, 5, 6],          # NEWAg #13
+    "z6-19602": [2],                # NEWAg #9
+    "z6-19604": [3],                # NEWAg #11
+    "z6-19597": [2, 3],             # NEWAg #4
+    "z6-19594": [2, 3, 4, 5, 6],    # NEWAg #1
+    "z6-19599": [3],                # NEWAg #6
+    "z6-12197": [2, 3, 4],          # NEWAg #15
+    "z6-19595": [2, 3, 4, 5, 6],    # NEWAg #2
+    "z6-19598": [3, 4],             # NEWAg #5
+    "z6-12202": [2, 3, 4],          # NEWAg #14
+    "z6-19596": [2, 3, 4, 5, 6],    # NEWAg #3
+    "z6-19603": [2, 3, 4, 5],       # NEWAg #10
+}
+
 
 def _parse_dt(value: str | None, default: datetime | None = None) -> datetime:
     if value is None or str(value).strip() == "":
@@ -26,11 +47,14 @@ def _parse_dt(value: str | None, default: datetime | None = None) -> datetime:
         return default
     return pd.to_datetime(value, utc=True).to_pydatetime()
 
+
 def _zentra_dt(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+
 def _stamp(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
 
 def _serials(value: Any) -> list[str]:
     if value is None or str(value).strip().upper() == "ALL":
@@ -42,9 +66,82 @@ def _serials(value: Any) -> list[str]:
         return [str(x).strip() for x in json.loads(s)]
     return [x.strip() for x in s.split(",") if x.strip()]
 
+
+def _parse_ports(value: Any) -> list[int] | None:
+    """
+    Accepts:
+      None / "" / "AUTO" -> use LOGGER_PORTS mapping.
+      "ALL" -> no port filtering.
+      "2,4,5" -> explicit ports.
+      [2, 4, 5] or "[2, 4, 5]" -> explicit ports.
+    Returns:
+      None when AUTO should be resolved later.
+      [] as the marker for ALL/no filtering.
+      list[int] for explicit ports.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return sorted({int(x) for x in value})
+    s = str(value).strip()
+    if s == "" or s.upper() == "AUTO":
+        return None
+    if s.upper() == "ALL":
+        return []
+    if s.startswith("["):
+        return sorted({int(x) for x in json.loads(s)})
+    return sorted({int(x.strip()) for x in s.split(",") if x.strip()})
+
+
+def _ports_for_serial(serial: str, ports: Any = "AUTO") -> list[int] | None:
+    """
+    Returns selected ports for a serial.
+    None means no filtering; list[int] means save only those ports.
+    """
+    parsed = _parse_ports(ports)
+    if parsed == []:
+        return None
+    if parsed is not None:
+        return parsed
+    mapped_ports = LOGGER_PORTS.get(serial)
+    if mapped_ports is None:
+        faasr_log(f"No port mapping found for {serial}; saving all ports.")
+        return None
+    return sorted({int(p) for p in mapped_ports})
+
+
+def _get_port_column(df: pd.DataFrame) -> str | None:
+    for col in ("port_num", "port_number", "port"):
+        if col in df.columns:
+            return col
+    return None
+
+
+def _filter_to_ports(df: pd.DataFrame, serial: str, ports: list[int] | None) -> pd.DataFrame:
+    """
+    Keep only selected ports before saving to S3.
+    If ports is None, save all rows.
+    """
+    if df.empty or ports is None:
+        return df
+    port_col = _get_port_column(df)
+    if port_col is None:
+        faasr_log(
+            f"Could not find a port column for {serial}; expected one of "
+            f"port_num, port_number, port. Saving all rows for this page."
+        )
+        return df
+    filtered = df.copy()
+    filtered[port_col] = pd.to_numeric(filtered[port_col], errors="coerce")
+    filtered = filtered[filtered[port_col].isin(ports)].copy()
+    faasr_log(f"Port filter for {serial}: kept {len(filtered)} of {len(df)} rows for ports {ports}.")
+    return filtered
+
+
 def _auth(token: str) -> dict[str, str]:
     token = token.strip()
     return {"Authorization": token if token.lower().startswith("token ") else f"Token {token}"}
+
 
 def _exists(remote_folder: str, remote_file: str) -> bool:
     prefix = f"{remote_folder}/{remote_file}" if remote_folder else remote_file
@@ -54,6 +151,7 @@ def _exists(remote_folder: str, remote_file: str) -> bool:
         return False
     return any(obj == prefix or obj.endswith(prefix) or obj == remote_file for obj in objs)
 
+
 def _load_progress(folder: str, filename: str) -> dict:
     if not _exists(folder, filename):
         return {}
@@ -62,11 +160,13 @@ def _load_progress(folder: str, filename: str) -> dict:
     with open(local, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def _upload_json(obj: dict, folder: str, filename: str) -> None:
     local = filename
     with open(local, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
     faasr_put_file(local_file=local, remote_folder=folder, remote_file=filename)
+
 
 def _fetch_page(token, serial, start_s, end_s, page_num, per_page, api_version, server):
     url = f"{server}/api/{api_version}/get_readings/"
@@ -92,6 +192,7 @@ def _fetch_page(token, serial, start_s, end_s, page_num, per_page, api_version, 
     except TypeError:
         return pd.DataFrame(data)
 
+
 def _fetch_page_retry(token, serial, start_s, end_s, page_num, per_page, api_version, server, sleep_seconds):
     for attempt in range(1, 6):
         try:
@@ -110,12 +211,15 @@ def _fetch_page_retry(token, serial, start_s, end_s, page_num, per_page, api_ver
             time.sleep(wait)
     return pd.DataFrame()
 
-def _upload_csv(df: pd.DataFrame, serial: str, start: datetime, end: datetime) -> str:
+
+def _upload_csv(df: pd.DataFrame, serial: str, start: datetime, end: datetime, ports: list[int] | None = None) -> str:
     folder = f"zentra_raw_backfill/{serial}"
-    file = f"zentra_{serial}_{_stamp(start)}_to_{_stamp(end)}.csv"
+    port_label = "allports" if ports is None else "ports-" + "-".join(str(p) for p in ports)
+    file = f"zentra_{serial}_{port_label}_{_stamp(start)}_to_{_stamp(end)}.csv"
     df.to_csv(file, index=False)
     faasr_put_file(local_file=file, remote_folder=folder, remote_file=file)
     return f"{folder}/{file}"
+
 
 def backfill_zentra_history(
     serial_numbers: str = "ALL",
@@ -128,10 +232,20 @@ def backfill_zentra_history(
     server: str = "https://zentracloud.com",
     api_version: str = "v4",
     progress_file: str = "zentra_backfill_progress.json",
+    ports: str = "AUTO",
 ):
     """
-    Resumable historical backfill. Re-run the FaaSr invoke repeatedly until done_all_devices=True
-    in zentra_backfill_state/zentra_backfill_progress.json.
+    Resumable historical backfill.
+
+    Port-aware behavior:
+    - ports="AUTO" uses LOGGER_PORTS from the Orchardgrass mapping.
+    - ports="ALL" saves all ports.
+    - ports="2,4,5" saves only explicitly listed ports.
+
+    The official Zentra get_readings API is queried by device serial number.
+    It does not expose a documented port filter in the public parameter list,
+    so this code filters port rows immediately after each API page is downloaded
+    and before the CSV is saved to S3.
     """
     token = faasr_secret("ZENTRA_TOKEN")
     serial_list = _serials(serial_numbers)
@@ -146,6 +260,8 @@ def backfill_zentra_history(
         "last_requested_end_date": global_end.isoformat(),
         "chunk_days": int(chunk_days),
         "per_page": int(per_page),
+        "ports_argument": ports,
+        "port_filtering": "filtered_after_api_page_before_s3_upload",
     })
 
     calls_used = 0
@@ -155,12 +271,18 @@ def backfill_zentra_history(
         if calls_used >= int(max_api_calls_per_run):
             break
 
+        selected_ports = _ports_for_serial(serial, ports=ports)
+        faasr_log(f"Selected ports for {serial}: {selected_ports if selected_ports is not None else 'ALL'}")
+
         device = progress["devices"].setdefault(serial, {
             "next_start": global_start.isoformat(),
             "done": False,
             "chunks_completed": 0,
             "rows_downloaded": 0,
+            "rows_saved_after_port_filter": 0,
+            "selected_ports": selected_ports,
         })
+        device["selected_ports"] = selected_ports
 
         if device.get("done"):
             continue
@@ -173,7 +295,9 @@ def backfill_zentra_history(
             start_s, end_s = _zentra_dt(chunk_start), _zentra_dt(chunk_end)
 
             page_num = 1
-            pages = []
+            filtered_pages = []
+            raw_rows_this_chunk = 0
+            saved_rows_this_chunk = 0
             chunk_complete = True
 
             while True:
@@ -181,22 +305,30 @@ def backfill_zentra_history(
                     chunk_complete = False
                     break
 
-                # Conservative project-wide/device-safe sleep between calls.
                 if calls_used > 0:
                     faasr_log(f"Sleeping {sleep_seconds}s before next API call")
                     time.sleep(int(sleep_seconds))
 
-                faasr_log(f"Fetching {serial}: {start_s} to {end_s}, page {page_num}")
-                df_page = _fetch_page_retry(
+                faasr_log(
+                    f"Fetching {serial}: {start_s} to {end_s}, page {page_num}, "
+                    f"ports={selected_ports if selected_ports is not None else 'ALL'}"
+                )
+                df_page_raw = _fetch_page_retry(
                     token, serial, start_s, end_s, page_num, per_page,
                     api_version, server, sleep_seconds
                 )
                 calls_used += 1
+                raw_rows_this_chunk += len(df_page_raw)
 
-                if not df_page.empty:
-                    pages.append(df_page)
+                df_page_filtered = _filter_to_ports(df_page_raw, serial=serial, ports=selected_ports)
+                saved_rows_this_chunk += len(df_page_filtered)
 
-                if len(df_page) < int(per_page):
+                if not df_page_filtered.empty:
+                    filtered_pages.append(df_page_filtered)
+
+                # Stop based on raw page length, not filtered page length.
+                # Otherwise later pages could be skipped when selected ports are sparse.
+                if len(df_page_raw) < int(per_page):
                     break
                 page_num += 1
 
@@ -204,15 +336,27 @@ def backfill_zentra_history(
                 faasr_log("API-call budget reached before chunk completed. Progress not advanced for this chunk.")
                 break
 
-            df_chunk = pd.concat(pages, ignore_index=True) if pages else pd.DataFrame()
+            df_chunk = pd.concat(filtered_pages, ignore_index=True) if filtered_pages else pd.DataFrame()
 
             if not df_chunk.empty:
-                remote_path = _upload_csv(df_chunk, serial, chunk_start, chunk_end)
-                files_written.append({"serial": serial, "path": remote_path, "rows": len(df_chunk)})
-                device["rows_downloaded"] = int(device.get("rows_downloaded", 0)) + len(df_chunk)
+                remote_path = _upload_csv(df_chunk, serial, chunk_start, chunk_end, ports=selected_ports)
+                files_written.append({
+                    "serial": serial,
+                    "path": remote_path,
+                    "raw_rows_downloaded_from_api": raw_rows_this_chunk,
+                    "rows_saved_after_port_filter": len(df_chunk),
+                    "selected_ports": selected_ports,
+                })
+                device["rows_downloaded"] = int(device.get("rows_downloaded", 0)) + raw_rows_this_chunk
+                device["rows_saved_after_port_filter"] = int(device.get("rows_saved_after_port_filter", 0)) + len(df_chunk)
                 device["last_file"] = remote_path
             else:
-                faasr_log(f"No rows for {serial}: {start_s} to {end_s}")
+                faasr_log(
+                    f"No rows for selected ports for {serial}: {start_s} to {end_s}. "
+                    f"Raw rows from API: {raw_rows_this_chunk}; selected ports: "
+                    f"{selected_ports if selected_ports is not None else 'ALL'}"
+                )
+                device["rows_downloaded"] = int(device.get("rows_downloaded", 0)) + raw_rows_this_chunk
 
             next_start = chunk_end
             device["next_start"] = next_start.isoformat()
@@ -230,21 +374,17 @@ def backfill_zentra_history(
         "calls_used": calls_used,
         "files_written": files_written,
         "done_all_devices": done_all,
+        "ports_argument": ports,
     }
     _upload_json(summary, state_folder, "zentra_backfill_last_run_summary.json")
     _upload_json(progress, state_folder, progress_file)
     faasr_log(f"Backfill run finished. done_all_devices={done_all}, calls_used={calls_used}")
     # Do not return the summary object to FaaSr. It is already saved to S3.
-    # Returning a dict can cause FaaSr RPC /faasr-return 422 errors.
-
 
 
 def initialize_parallel_backfill():
     """
     Start node for the parallel Zentra historical backfill workflow.
-
-    This function does not fetch data. It only creates a clean root node
-    for the FaaSr DAG before fan-out to the 13 logger-specific backfill actions.
     """
     faasr_log("Starting parallel Zentra historical backfill across logger serial numbers.")
 
@@ -252,6 +392,5 @@ def initialize_parallel_backfill():
 def finish_backfill():
     """
     Terminal function used only to avoid a single-node FaaSr DAG.
-    The actual work is done in backfill_zentra_history().
     """
     faasr_log("Zentra backfill workflow finished.")
