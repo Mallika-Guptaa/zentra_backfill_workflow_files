@@ -1,0 +1,113 @@
+{
+  "ActionList": {
+    "FetchDailyZentraRaw": {
+      "Arguments": {
+        "serial_numbers": "ALL",
+        "lookback_hours": 26,
+        "buffer_hours": 1,
+        "raw_prefix": "zentra_raw_backfill",
+        "state_prefix": "zentra_daily_update_state",
+        "per_page": 2000,
+        "sleep_seconds": 65,
+        "sleep_between_serials": 2,
+        "server": "https://zentracloud.com",
+        "api_version": "v4",
+        "ports": "AUTO"
+      },
+      "InvokeNext": [
+        "ReadZentraRawFiles"
+      ],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "fetch_daily_zentra_raw"
+    },
+    "ReadZentraRawFiles": {
+      "Arguments": {
+        "raw_prefix": "zentra_raw_backfill",
+        "staging_prefix": "zentra_phase2_daily_staging",
+        "max_files_per_serial": "ALL",
+        "output_prefix": "zentra_final_12_configs"
+      },
+      "InvokeNext": [
+        "Form12ConfigCSVs"
+      ],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "read_zentra_raw_files"
+    },
+    "Form12ConfigCSVs": {
+      "Arguments": {
+        "staging_prefix": "zentra_phase2_daily_staging",
+        "generated_prefix": "zentra_phase2_daily_staging/generated_12_configs"
+      },
+      "InvokeNext": [
+        "Upload12ConfigCSVs"
+      ],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "form_12_config_csvs"
+    },
+    "Upload12ConfigCSVs": {
+      "Arguments": {
+        "generated_prefix": "zentra_phase2_daily_staging/generated_12_configs",
+        "output_prefix": "zentra_final_12_configs",
+        "staging_prefix": "zentra_phase2_daily_staging"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "upload_12_config_csvs"
+    }
+  },
+  "ComputeServers": {
+    "GH": {
+      "FaaSType": "GitHubActions",
+      "UseSecretStore": true,
+      "ActionRepoName": "FaaSr-workflow",
+      "Branch": "main",
+      "UserName": "Mallika-Guptaa"
+    }
+  },
+  "DataStores": {
+    "S3PRIVATE": {
+      "Bucket": "faasr-bucket-smarttap-private",
+      "Region": "us-east-1",
+      "Writable": "TRUE"
+    }
+  },
+  "ActionContainers": {
+    "FetchDailyZentraRaw": "ghcr.io/faasr/github-actions-python:latest",
+    "ReadZentraRawFiles": "ghcr.io/faasr/github-actions-python:latest",
+    "Form12ConfigCSVs": "ghcr.io/faasr/github-actions-python:latest",
+    "Upload12ConfigCSVs": "ghcr.io/faasr/github-actions-python:latest"
+  },
+  "FunctionInvoke": "FetchDailyZentraRaw",
+  "DefaultDataStore": "S3PRIVATE",
+  "FunctionGitRepo": {
+    "fetch_daily_zentra_raw": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "read_zentra_raw_files": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "form_12_config_csvs": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "upload_12_config_csvs": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
+  },
+  "PyPIPackageDownloads": {
+    "fetch_daily_zentra_raw": [
+      "pandas",
+      "requests"
+    ],
+    "read_zentra_raw_files": [
+      "pandas"
+    ],
+    "form_12_config_csvs": [
+      "pandas"
+    ],
+    "upload_12_config_csvs": [
+      "pandas"
+    ]
+  },
+  "Secrets": [
+    "ZENTRA_TOKEN"
+  ],
+  "FaaSrLog": "FaaSrLog",
+  "LoggingDataStore": "S3PRIVATE",
+  "WorkflowName": "ZentraDailyUpdate"
+}
