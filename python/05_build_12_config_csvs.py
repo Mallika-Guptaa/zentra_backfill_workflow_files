@@ -176,6 +176,30 @@ def _put_json(obj: dict, remote_folder: str, remote_file: str) -> None:
     faasr_put_file(local_file=remote_file, remote_folder=remote_folder, remote_file=remote_file)
 
 
+
+def _s3_object_exists(remote_folder: str, remote_file: str) -> bool:
+    """
+    Safely check whether an object exists before calling faasr_get_file.
+
+    FaaSr's faasr_get_file can terminate the whole action if the object is missing,
+    so missing files must be detected with faasr_get_folder_list first.
+    """
+    key = f"{remote_folder}/{remote_file}" if remote_folder else remote_file
+
+    try:
+        objects = _normalize_list_result(faasr_get_folder_list(prefix=key))
+    except Exception as exc:
+        faasr_log(f"Could not check S3 object existence for {key}: {exc}")
+        return False
+
+    for obj in objects:
+        obj = str(obj).strip()
+        if obj == key or obj.endswith(f"/{remote_file}") or obj == remote_file:
+            return True
+
+    return False
+
+
 def _standardize_raw_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize common column name variants without changing the long-format data.
@@ -270,42 +294,42 @@ def _load_existing_source_files(output_prefix: str) -> dict[str, set[str]]:
     """
     Read existing final 12 CSVs and collect the source_file values already included.
 
-    Returns:
-      {
-        "C_O_N": {"zentra_raw_backfill/z6-19600/file1.csv", ...},
-        ...
-      }
-
-    This enables incremental Phase 2 runs:
-    - If a raw source file is already present in the corresponding final CSV,
-      it does not need to be staged again.
-    - If a final CSV does not exist yet, its processed-source set is empty.
+    Safe for first runs:
+    If zentra_final_12_configs/<CONFIG>.csv does not exist yet, this function
+    does NOT call faasr_get_file. That avoids FaaSr action failure on missing S3
+    objects.
     """
     existing_sources: dict[str, set[str]] = {code: set() for code in CONFIG_CODES}
 
     for config_code in CONFIG_CODES:
         filename = f"{config_code}.csv"
+
+        if not _s3_object_exists(output_prefix, filename):
+            faasr_log(f"No existing final file for {config_code}; treating as first build.")
+            continue
+
         try:
             df_existing = _download_csv(output_prefix, filename, f"_existing_sources_{filename}")
-            if "source_file" in df_existing.columns:
-                existing_sources[config_code] = set(
-                    df_existing["source_file"]
-                    .dropna()
-                    .astype(str)
-                    .str.strip()
-                    .tolist()
-                )
-                faasr_log(
-                    f"Existing {filename}: found "
-                    f"{len(existing_sources[config_code])} processed source files"
-                )
-            else:
-                faasr_log(f"Existing {filename} has no source_file column; treating as not processed.")
         except Exception as exc:
-            faasr_log(f"No existing final file for {config_code} or could not read it: {exc}")
+            faasr_log(f"Could not read existing final file {filename}; treating as not processed. Detail: {exc}")
+            continue
+
+        if "source_file" in df_existing.columns:
+            existing_sources[config_code] = set(
+                df_existing["source_file"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .tolist()
+            )
+            faasr_log(
+                f"Existing {filename}: found "
+                f"{len(existing_sources[config_code])} processed source files"
+            )
+        else:
+            faasr_log(f"Existing {filename} has no source_file column; treating as not processed.")
 
     return existing_sources
-
 
 def _raw_source_needed_for_serial(
     mapping: pd.DataFrame,
@@ -616,12 +640,16 @@ def upload_12_config_csvs(
 
         existing_df = None
         existing_rows = 0
-        try:
-            existing_df = _download_csv(output_prefix, filename, f"existing_{filename}")
-            existing_rows = int(len(existing_df))
-            faasr_log(f"Existing final {filename} found with {existing_rows} rows")
-        except Exception as exc:
-            faasr_log(f"No existing final {filename}; creating it fresh. Detail: {exc}")
+
+        if _s3_object_exists(output_prefix, filename):
+            try:
+                existing_df = _download_csv(output_prefix, filename, f"existing_{filename}")
+                existing_rows = int(len(existing_df))
+                faasr_log(f"Existing final {filename} found with {existing_rows} rows")
+            except Exception as exc:
+                faasr_log(f"Could not read existing final {filename}; creating from generated rows only. Detail: {exc}")
+        else:
+            faasr_log(f"No existing final {filename}; creating it fresh.")
 
         final_df = _merge_existing_and_generated(existing_df, generated_df)
         final_rows = int(len(final_df))
