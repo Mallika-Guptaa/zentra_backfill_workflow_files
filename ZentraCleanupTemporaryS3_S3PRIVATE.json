@@ -10,10 +10,19 @@
         "access_key_secret": "S3PRIVATE_ACCESSKEY",
         "secret_key_secret": "S3PRIVATE_SECRETKEY"
       },
-      "InvokeNext": [],
+      "InvokeNext": [
+        "FinishCleanupTemporaryS3"
+      ],
       "FaaSServer": "GH",
       "Type": "Python",
       "FunctionName": "cleanup_temporary_s3_folders"
+    },
+    "FinishCleanupTemporaryS3": {
+      "Arguments": {},
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "finish_cleanup_temporary_s3"
     }
   },
   "ComputeServers": {
@@ -33,15 +42,20 @@
     }
   },
   "ActionContainers": {
-    "CleanupTemporaryS3Folders": "ghcr.io/faasr/github-actions-python:latest"
+    "CleanupTemporaryS3Folders": "ghcr.io/faasr/github-actions-python:latest",
+    "FinishCleanupTemporaryS3": "ghcr.io/faasr/github-actions-python:latest"
   },
   "FunctionInvoke": "CleanupTemporaryS3Folders",
   "DefaultDataStore": "S3PRIVATE",
   "FunctionGitRepo": {
-    "cleanup_temporary_s3_folders": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
+    "cleanup_temporary_s3_folders": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "finish_cleanup_temporary_s3": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
   },
   "PyPIPackageDownloads": {
     "cleanup_temporary_s3_folders": [
+      "boto3"
+    ],
+    "finish_cleanup_temporary_s3": [
       "boto3"
     ]
   },
