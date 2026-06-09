@@ -1,27 +1,43 @@
 import json
-import os
-from datetime import datetime, timezone, timedelta
 from typing import Any
 
-import boto3
-from FaaSr_py.client.py_client_stubs import faasr_log, faasr_secret
+from FaaSr_py.client.py_client_stubs import (
+    faasr_delete_file,
+    faasr_get_folder_list,
+    faasr_log,
+)
 
-
+# Only these temporary folders are allowed to be cleaned.
 DEFAULT_CLEANUP_PREFIXES = [
     "zentra_phase2_staging/",
     "zentra_phase2_daily_staging/",
 ]
 
-
+# These folders must never be deleted by this workflow.
 PROTECTED_PREFIXES = [
     "zentra_raw_backfill/",
     "zentra_final_12_configs/",
     "zentra_daily_update_state/",
     "zentra_backfill_state/",
+    "FaaSrLog/",
 ]
 
 
+def _normalize_list_result(objects: Any) -> list[str]:
+    if objects is None:
+        return []
+    if isinstance(objects, list):
+        return [str(x) for x in objects]
+    return [str(objects)]
+
+
 def _parse_prefixes(value: Any) -> list[str]:
+    """
+    Accept either:
+      - comma-separated string: "folder1,folder2"
+      - JSON/list string: ["folder1", "folder2"]
+      - Python list
+    """
     if value is None:
         prefixes = DEFAULT_CLEANUP_PREFIXES
     elif isinstance(value, list):
@@ -36,176 +52,158 @@ def _parse_prefixes(value: Any) -> list[str]:
             prefixes = [x.strip() for x in s.split(",") if x.strip()]
 
     normalized = []
-    for p in prefixes:
-        p = p.lstrip("/")
-        if p and not p.endswith("/"):
-            p += "/"
-        if p:
-            normalized.append(p)
+    for prefix in prefixes:
+        prefix = str(prefix).strip().lstrip("/")
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        if prefix:
+            normalized.append(prefix)
+
     return normalized
 
 
-def _is_safe_prefix(prefix: str) -> bool:
-    if not prefix or prefix in ["*", "/"]:
+def _is_safe_cleanup_prefix(prefix: str) -> bool:
+    """
+    Very conservative safety checks.
+
+    This workflow is only for temporary staging folders.
+    It must not delete raw data, final 12 CSVs, daily state, backfill state, or logs.
+    """
+    if not prefix or prefix in ["/", "*", ".", "./"]:
         return False
 
     for protected in PROTECTED_PREFIXES:
         if prefix.startswith(protected) or protected.startswith(prefix):
             return False
 
-    return True
+    return prefix in DEFAULT_CLEANUP_PREFIXES
 
 
-def _get_secret_or_env(name: str) -> str:
+def _remote_folder_and_file(default_folder: str, obj: str) -> tuple[str, str]:
     """
-    FaaSr already injects datastore credentials as environment variables.
-    Do not require listing S3PRIVATE_ACCESSKEY/S3PRIVATE_SECRETKEY again in the
-    workflow Secrets list, because that can create duplicate GitHub Action env keys.
+    Convert an S3 key into remote_folder + remote_file for faasr_delete_file.
+
+    faasr_get_folder_list may return either:
+      - full key: zentra_phase2_staging/raw_by_serial/file.csv
+      - relative/bare key depending on FaaSr version
     """
-    value = os.getenv(name)
-    if value:
-        return value
-    return faasr_secret(name)
+    obj = str(obj).strip().lstrip("/")
+
+    if "/" in obj:
+        return "/".join(obj.split("/")[:-1]), obj.split("/")[-1]
+
+    default_folder = default_folder.strip().rstrip("/")
+    return default_folder, obj
 
 
-def _client(region: str, access_key_secret: str, secret_key_secret: str):
-    access_key = _get_secret_or_env(access_key_secret)
-    secret_key = _get_secret_or_env(secret_key_secret)
+def _delete_prefix(prefix: str, dry_run_bool: bool) -> dict:
+    """
+    Delete all objects under one safe staging prefix using FaaSr's datastore API.
+    """
+    if not _is_safe_cleanup_prefix(prefix):
+        faasr_log(f"Skipping unsafe or protected cleanup prefix: {prefix}")
+        return {
+            "status": "skipped_unsafe_or_protected",
+            "listed_objects": 0,
+            "deleted_objects": 0,
+            "errors": [],
+        }
 
-    return boto3.client(
-        "s3",
-        region_name=region,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-    )
+    try:
+        objects = _normalize_list_result(faasr_get_folder_list(prefix=prefix))
+    except Exception as exc:
+        faasr_log(f"Could not list prefix {prefix}: {exc}")
+        return {
+            "status": "list_failed",
+            "listed_objects": 0,
+            "deleted_objects": 0,
+            "errors": [str(exc)],
+        }
 
+    # Keep only objects that are actually under the target prefix.
+    # This avoids deleting unrelated objects if a backend returns broader results.
+    objects = [
+        str(obj).strip()
+        for obj in objects
+        if str(obj).strip().lstrip("/").startswith(prefix)
+    ]
 
-def _delete_batch(s3, bucket: str, objects: list[dict], dry_run: bool) -> int:
-    if not objects:
-        return 0
+    deleted = 0
+    errors = []
 
-    if dry_run:
-        return len(objects)
+    for obj in objects:
+        remote_folder, remote_file = _remote_folder_and_file(prefix, obj)
 
-    response = s3.delete_objects(
-        Bucket=bucket,
-        Delete={
-            "Objects": [{"Key": obj["Key"]} for obj in objects],
-            "Quiet": True,
-        },
-    )
-    deleted = response.get("Deleted", [])
-    errors = response.get("Errors", [])
+        if dry_run_bool:
+            faasr_log(f"[DRY RUN] Would delete {remote_folder}/{remote_file}")
+            deleted += 1
+            continue
 
-    if errors:
-        faasr_log(f"Delete batch had errors: {errors}")
+        try:
+            faasr_delete_file(remote_folder=remote_folder, remote_file=remote_file)
+            deleted += 1
+            faasr_log(f"Deleted {remote_folder}/{remote_file}")
+        except Exception as exc:
+            msg = f"Failed to delete {remote_folder}/{remote_file}: {exc}"
+            faasr_log(msg)
+            errors.append(msg)
 
-    return len(deleted)
+    return {
+        "status": "ok" if not errors else "completed_with_errors",
+        "listed_objects": len(objects),
+        "deleted_objects": deleted,
+        "errors": errors,
+    }
 
 
 def cleanup_temporary_s3_folders(
-    bucket: str = "faasr-bucket-smarttap-private",
-    region: str = "us-east-1",
     cleanup_prefixes: str = "zentra_phase2_staging,zentra_phase2_daily_staging",
-    retention_hours: int = 4,
     dry_run: str = "false",
-    access_key_secret: str = "S3PRIVATE_ACCESSKEY",
-    secret_key_secret: str = "S3PRIVATE_SECRETKEY",
 ):
     """
-    Delete temporary S3 staging folders after the main Zentra workflows are done.
+    Cleanup temporary S3 staging folders using the FaaSr datastore API.
 
-    Default folders deleted:
+    This version intentionally does NOT use boto3 and does NOT request
+    S3PRIVATE_ACCESSKEY/S3PRIVATE_SECRETKEY as separate secrets.
+
+    It relies on the workflow JSON's DefaultDataStore = S3PRIVATE, exactly like
+    the working daily update and 12-config workflows.
+
+    Deletes:
       - zentra_phase2_staging/
       - zentra_phase2_daily_staging/
 
-    Protected folders that this function will not delete:
+    Never deletes:
       - zentra_raw_backfill/
       - zentra_final_12_configs/
       - zentra_daily_update_state/
       - zentra_backfill_state/
-
-    retention_hours prevents deleting files from a workflow that may still be running.
-    Example:
-      retention_hours=4 means only staging objects older than 4 hours are deleted.
+      - FaaSrLog/
     """
-    dry = str(dry_run).strip().lower() in ["true", "1", "yes", "y"]
+    dry_run_bool = str(dry_run).strip().lower() in ["true", "1", "yes", "y"]
     prefixes = _parse_prefixes(cleanup_prefixes)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=int(retention_hours))
 
-    faasr_log(
-        f"Starting cleanup. bucket={bucket}, prefixes={prefixes}, "
-        f"retention_hours={retention_hours}, cutoff={cutoff.isoformat()}, dry_run={dry}"
-    )
-
-    s3 = _client(region, access_key_secret, secret_key_secret)
+    faasr_log(f"Starting temporary S3 cleanup. prefixes={prefixes}, dry_run={dry_run_bool}")
 
     summary = {
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "bucket": bucket,
-        "region": region,
-        "retention_hours": int(retention_hours),
-        "dry_run": dry,
-        "prefixes": {},
+        "cleanup_prefixes": prefixes,
+        "dry_run": dry_run_bool,
+        "results": {},
     }
 
     for prefix in prefixes:
-        if not _is_safe_prefix(prefix):
-            faasr_log(f"Skipping unsafe/protected prefix: {prefix}")
-            summary["prefixes"][prefix] = {
-                "status": "skipped_unsafe_or_protected",
-                "listed_objects": 0,
-                "eligible_for_delete": 0,
-                "deleted": 0,
-            }
-            continue
-
-        paginator = s3.get_paginator("list_objects_v2")
-
-        listed = 0
-        eligible = 0
-        deleted = 0
-        batch = []
-
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                listed += 1
-                key = obj["Key"]
-                last_modified = obj["LastModified"]
-
-                if last_modified <= cutoff:
-                    eligible += 1
-                    batch.append({"Key": key})
-
-                if len(batch) >= 1000:
-                    deleted += _delete_batch(s3, bucket, batch, dry)
-                    batch = []
-
-        if batch:
-            deleted += _delete_batch(s3, bucket, batch, dry)
-
-        summary["prefixes"][prefix] = {
-            "status": "ok",
-            "listed_objects": listed,
-            "eligible_for_delete": eligible,
-            "deleted": deleted,
-        }
-
-        faasr_log(
-            f"Cleanup prefix={prefix}: listed={listed}, "
-            f"eligible={eligible}, deleted={deleted}, dry_run={dry}"
-        )
+        summary["results"][prefix] = _delete_prefix(prefix, dry_run_bool)
 
     faasr_log("Cleanup summary:")
     faasr_log(json.dumps(summary, indent=2, sort_keys=True))
     faasr_log("Temporary S3 cleanup complete.")
 
+
 def finish_cleanup_temporary_s3():
     """
-    Small terminal node for FaaSr DAG validation.
+    Terminal no-op node.
 
-    Some FaaSr versions do not like a one-action workflow with InvokeNext=[].
-    This no-op finish node gives the workflow a clear terminal state.
+    This keeps the cleanup workflow DAG structure consistent with the working
+    multi-action workflows and avoids one-node DAG validation issues.
     """
     faasr_log("Cleanup workflow finished successfully.")
-
