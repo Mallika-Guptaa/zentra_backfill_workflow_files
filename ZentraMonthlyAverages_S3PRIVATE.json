@@ -1,0 +1,61 @@
+{
+  "ActionList": {
+    "BuildMonthlyAverages": {
+      "Arguments": {
+        "input_prefix": "zentra_final_12_configs",
+        "output_prefix": "Zentra_monthly_averages"
+      },
+      "InvokeNext": [
+        "FinishMonthlyAverages"
+      ],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "build_monthly_averages"
+    },
+    "FinishMonthlyAverages": {
+      "Arguments": {},
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "finish_monthly_averages"
+    }
+  },
+  "ComputeServers": {
+    "GH": {
+      "FaaSType": "GitHubActions",
+      "UseSecretStore": true,
+      "ActionRepoName": "FaaSr-workflow",
+      "Branch": "main",
+      "UserName": "Mallika-Guptaa"
+    }
+  },
+  "DataStores": {
+    "S3PRIVATE": {
+      "Bucket": "faasr-bucket-smarttap-private",
+      "Region": "us-east-1",
+      "Writable": "TRUE"
+    }
+  },
+  "ActionContainers": {
+    "BuildMonthlyAverages": "ghcr.io/faasr/github-actions-python:latest",
+    "FinishMonthlyAverages": "ghcr.io/faasr/github-actions-python:latest"
+  },
+  "FunctionInvoke": "BuildMonthlyAverages",
+  "DefaultDataStore": "S3PRIVATE",
+  "FunctionGitRepo": {
+    "build_monthly_averages": "Mallika-Guptaa/zentra_backfill_workflow_files/python",
+    "finish_monthly_averages": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
+  },
+  "PyPIPackageDownloads": {
+    "build_monthly_averages": [
+      "pandas"
+    ],
+    "finish_monthly_averages": [
+      "pandas"
+    ]
+  },
+  "Secrets": [],
+  "FaaSrLog": "FaaSrLog",
+  "LoggingDataStore": "S3PRIVATE",
+  "WorkflowName": "ZentraMonthlyAverages"
+}
