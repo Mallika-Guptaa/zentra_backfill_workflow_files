@@ -186,3 +186,13 @@ def cleanup_temporary_s3_folders(
     faasr_log("Cleanup summary:")
     faasr_log(json.dumps(summary, indent=2, sort_keys=True))
     faasr_log("Temporary S3 cleanup complete.")
+
+def finish_cleanup_temporary_s3():
+    """
+    Small terminal node for FaaSr DAG validation.
+
+    Some FaaSr versions do not like a one-action workflow with InvokeNext=[].
+    This no-op finish node gives the workflow a clear terminal state.
+    """
+    faasr_log("Cleanup workflow finished successfully.")
+
