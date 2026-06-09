@@ -59,10 +59,7 @@
       "boto3"
     ]
   },
-  "Secrets": [
-    "S3PRIVATE_ACCESSKEY",
-    "S3PRIVATE_SECRETKEY"
-  ],
+  "Secrets": [],
   "FaaSrLog": "FaaSrLog",
   "LoggingDataStore": "S3PRIVATE",
   "WorkflowName": "ZentraCleanupTemporaryS3"
