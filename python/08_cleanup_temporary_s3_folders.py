@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -55,9 +56,21 @@ def _is_safe_prefix(prefix: str) -> bool:
     return True
 
 
+def _get_secret_or_env(name: str) -> str:
+    """
+    FaaSr already injects datastore credentials as environment variables.
+    Do not require listing S3PRIVATE_ACCESSKEY/S3PRIVATE_SECRETKEY again in the
+    workflow Secrets list, because that can create duplicate GitHub Action env keys.
+    """
+    value = os.getenv(name)
+    if value:
+        return value
+    return faasr_secret(name)
+
+
 def _client(region: str, access_key_secret: str, secret_key_secret: str):
-    access_key = faasr_secret(access_key_secret)
-    secret_key = faasr_secret(secret_key_secret)
+    access_key = _get_secret_or_env(access_key_secret)
+    secret_key = _get_secret_or_env(secret_key_secret)
 
     return boto3.client(
         "s3",
