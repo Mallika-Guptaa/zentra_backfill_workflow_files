@@ -2,13 +2,8 @@
   "ActionList": {
     "CleanupTemporaryS3Folders": {
       "Arguments": {
-        "bucket": "faasr-bucket-smarttap-private",
-        "region": "us-east-1",
         "cleanup_prefixes": "zentra_phase2_staging,zentra_phase2_daily_staging",
-        "retention_hours": 4,
-        "dry_run": "false",
-        "access_key_secret": "S3PRIVATE_ACCESSKEY",
-        "secret_key_secret": "S3PRIVATE_SECRETKEY"
+        "dry_run": "false"
       },
       "InvokeNext": [
         "FinishCleanupTemporaryS3"
@@ -53,10 +48,12 @@
   },
   "PyPIPackageDownloads": {
     "cleanup_temporary_s3_folders": [
-      "boto3"
+      "pandas",
+      "requests"
     ],
     "finish_cleanup_temporary_s3": [
-      "boto3"
+      "pandas",
+      "requests"
     ]
   },
   "Secrets": [],
