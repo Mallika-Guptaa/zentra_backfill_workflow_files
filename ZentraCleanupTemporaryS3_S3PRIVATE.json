@@ -1,0 +1,55 @@
+{
+  "ActionList": {
+    "CleanupTemporaryS3Folders": {
+      "Arguments": {
+        "bucket": "faasr-bucket-smarttap-private",
+        "region": "us-east-1",
+        "cleanup_prefixes": "zentra_phase2_staging,zentra_phase2_daily_staging",
+        "retention_hours": 4,
+        "dry_run": "false",
+        "access_key_secret": "S3PRIVATE_ACCESSKEY",
+        "secret_key_secret": "S3PRIVATE_SECRETKEY"
+      },
+      "InvokeNext": [],
+      "FaaSServer": "GH",
+      "Type": "Python",
+      "FunctionName": "cleanup_temporary_s3_folders"
+    }
+  },
+  "ComputeServers": {
+    "GH": {
+      "FaaSType": "GitHubActions",
+      "UseSecretStore": true,
+      "ActionRepoName": "FaaSr-workflow",
+      "Branch": "main",
+      "UserName": "Mallika-Guptaa"
+    }
+  },
+  "DataStores": {
+    "S3PRIVATE": {
+      "Bucket": "faasr-bucket-smarttap-private",
+      "Region": "us-east-1",
+      "Writable": "TRUE"
+    }
+  },
+  "ActionContainers": {
+    "CleanupTemporaryS3Folders": "ghcr.io/faasr/github-actions-python:latest"
+  },
+  "FunctionInvoke": "CleanupTemporaryS3Folders",
+  "DefaultDataStore": "S3PRIVATE",
+  "FunctionGitRepo": {
+    "cleanup_temporary_s3_folders": "Mallika-Guptaa/zentra_backfill_workflow_files/python"
+  },
+  "PyPIPackageDownloads": {
+    "cleanup_temporary_s3_folders": [
+      "boto3"
+    ]
+  },
+  "Secrets": [
+    "S3PRIVATE_ACCESSKEY",
+    "S3PRIVATE_SECRETKEY"
+  ],
+  "FaaSrLog": "FaaSrLog",
+  "LoggingDataStore": "S3PRIVATE",
+  "WorkflowName": "ZentraCleanupTemporaryS3"
+}
