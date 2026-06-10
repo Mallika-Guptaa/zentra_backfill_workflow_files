@@ -27,12 +27,14 @@ MONTHLY_OUTPUT_COLUMNS = [
     "logger_serial_number",
     "port_num",
     "port_description",
+    "measurement",
     "date_time",
     "Value",
     "Units",
 ]
 
 # User-facing grouping fields.
+# measurement is included so different sensor measurements are not averaged together.
 # Units is added internally so values with different units are not mixed.
 GROUP_COLUMNS = [
     "Location_code",
@@ -42,6 +44,7 @@ GROUP_COLUMNS = [
     "logger_serial_number",
     "port_num",
     "port_description",
+    "measurement",
     "Units",
     "_month_key",
 ]
@@ -105,6 +108,7 @@ def _standardize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
         "irrigation_code": "Irrigation_code",
         "units": "Units",
         "value": "Value",
+        "Measurement": "measurement",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
@@ -116,6 +120,7 @@ def _standardize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
         "logger_serial_number",
         "port_num",
         "port_description",
+        "measurement",
         "datetime",
         "Value",
         "Units",
@@ -154,11 +159,12 @@ def _build_monthly_for_config(df: pd.DataFrame) -> pd.DataFrame:
 
     Requested grouping:
       Location_code, Shade_zone_code, Irrigation_code, logger_name,
-      logger_serial_number, port_num
+      logger_serial_number, port_num, measurement
 
     We also include port_description because it is in the requested output,
-    and Units because values with different units should never be averaged
-    together.
+    measurement because different sensor measurements should not be averaged
+    together, and Units because values with different units should never be
+    averaged together.
     """
     df = _standardize_input_columns(df)
 
@@ -188,6 +194,7 @@ def _build_monthly_for_config(df: pd.DataFrame) -> pd.DataFrame:
         "logger_name",
         "logger_serial_number",
         "port_num",
+        "measurement",
         "date_time",
         "Units",
     ]
@@ -213,7 +220,7 @@ def build_monthly_averages(
 
     The output CSV has exactly these columns:
       Location_code, Shade_zone_code, Irrigation_code, logger_name,
-      logger_serial_number, port_num, port_description, date_time, Value, Units
+      logger_serial_number, port_num, port_description, measurement, date_time, Value, Units
 
     Existing monthly average files are overwritten with the same filenames.
     A separate delete step is not needed.
@@ -228,7 +235,8 @@ def build_monthly_averages(
         "mode": "full_rebuild_monthly_averages_exact_requested_format",
         "output_columns": MONTHLY_OUTPUT_COLUMNS,
         "grouping_note": (
-            "Grouped by requested fields plus port_description and Units. "
+            "Grouped by requested fields plus port_description, measurement, and Units. "
+            "measurement is included to avoid averaging different sensor measurements together; "
             "Units is included to avoid averaging values with different units together."
         ),
         "date_time_note": (
@@ -287,6 +295,11 @@ def build_monthly_averages(
                     []
                     if monthly_df.empty
                     else sorted(monthly_df["port_num"].dropna().astype(str).unique().tolist())
+                ),
+                "measurements": (
+                    []
+                    if monthly_df.empty
+                    else sorted(monthly_df["measurement"].dropna().astype(str).unique().tolist())
                 ),
                 "units": (
                     []
