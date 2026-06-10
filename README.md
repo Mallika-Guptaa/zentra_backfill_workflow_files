@@ -613,20 +613,6 @@ Choose the same workflow JSON file.
 
 ---
 
-## 11. Important Notes
-
-1. Do not use the historical parallel backfill workflow as the daily workflow.
-2. The daily workflow should use incremental mode and merge mode.
-3. The strict full rebuild workflow should use full mode and overwrite mode.
-4. The final 12 CSV mapping depends on `logger_serial_number + port_num`.
-5. The raw CSV does not contain `logger_serial_number`; it is derived from the file path or S3 folder.
-6. The anomaly detector uses only `measurement + value`.
-7. Resend email should only run when new anomalies are found.
-8. Monthly averages should run after the daily update has completed.
-9. Cleanup should run after the daily and monthly workflows.
-
----
-
 ## 12. Current Production Flow
 
 ```text
