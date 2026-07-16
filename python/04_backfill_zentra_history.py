@@ -34,7 +34,7 @@ LOGGER_PORTS = {
     "z6-19599": [3],                # NEWAg #6
     "z6-12197": [2, 3, 4],          # NEWAg #15
     "z6-19595": [2, 3, 4, 5, 6],    # NEWAg #2
-    "z6-19598": [3, 4],             # NEWAg #5
+    "z6-19598": [3, 4, 5],          # NEWAg #5; port 5 added from 2025-08-21 onward
     "z6-12202": [2, 3, 4],          # NEWAg #14
     "z6-19596": [2, 3, 4, 5, 6],    # NEWAg #3
     "z6-19603": [2, 3, 4, 5],       # NEWAg #10
@@ -401,6 +401,12 @@ def backfill_zentra_history(
     - ports="AUTO" uses LOGGER_PORTS from the Orchardgrass mapping.
     - ports="ALL" saves all ports.
     - ports="2,4,5" saves only explicitly listed ports.
+
+    Special z6-19598 port 5 recovery:
+    - The JSON includes a dedicated Backfill-z6-19598-Port5 action.
+    - That action uses ports="5", start_date="2025-08-21 00:00:00",
+      and start_from_s3_latest="FALSE" so it does not skip by looking at
+      newer z6-19598 port 3/4 files.
 
     Recovery behavior:
     - start_from_s3_latest="TRUE" makes S3 raw files the source of truth.
