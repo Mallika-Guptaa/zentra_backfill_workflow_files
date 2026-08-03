@@ -12,6 +12,9 @@ from FaaSr_py.client.py_client_stubs import (
 )
 
 # Orchardgrass trial mapping.
+MAPPING_VERSION = "orchardgrass-v2-2026-07-22-z6-19598-port5-swd"
+PORT5_SWD_START_UTC = pd.Timestamp("2025-08-21T00:00:00-07:00").tz_convert("UTC")
+
 # Final segregation rule:
 # 12 CSVs = Location + Shade Zone + Irrigation.
 # Rows inside each CSV are selected by logger_serial_number + port_num.
@@ -45,6 +48,7 @@ MAPPING_ROWS = [
     ("S_W_D", "S", "Solar Array", "W", "West", "D", "Deficit (50% of daily evapotranspiration)", "NEWAg #2", "z6-19595", 3, "20-30 cm soil", ""),
     ("S_W_D", "S", "Solar Array", "W", "West", "D", "Deficit (50% of daily evapotranspiration)", "NEWAg #2", "z6-19595", 5, "5-10 cm soil", ""),
     ("S_W_D", "S", "Solar Array", "W", "West", "D", "Deficit (50% of daily evapotranspiration)", "NEWAg #2", "z6-19595", 6, "IR camera", ""),
+    ("S_W_D", "S", "Solar Array", "W", "West", "D", "Deficit (50% of daily evapotranspiration)", "NEWAg #5", "z6-19598", 5, "Port 5 (sensor description to confirm)", "Added to S_W_D from 2025-08-21 onward."),
 
     ("S_C_D", "S", "Solar Array", "C", "Center", "D", "Deficit (50% of daily evapotranspiration)", "NEWAg #2", "z6-19595", 2, "20-30 cm soil", ""),
     ("S_C_D", "S", "Solar Array", "C", "Center", "D", "Deficit (50% of daily evapotranspiration)", "NEWAg #2", "z6-19595", 4, "5-10 cm soil", ""),
@@ -349,41 +353,35 @@ def _prepare_raw_df(df: pd.DataFrame, serial: str, source_path: str, allowed_por
 
 
 def _dedupe_and_sort(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Preserve every row from each raw source file.
+
+    The previous implementation removed matching rows across overlapping raw
+    files. That made a source file's filtered row count differ from its
+    contribution to the final 12 CSVs. The new implementation only sorts.
+
+    Duplicate prevention is handled at the source-file level by the processing
+    manifest: a raw filename is processed once unless it is deliberately
+    rebuilt or reprocessed.
+    """
     if df.empty:
         return df.reset_index(drop=True)
 
-    dedupe_cols = [
-        c for c in [
-            "logger_serial_number",
-            "port_num",
-            "timestamp_utc",
-            "datetime",
-            "measurement",
-            "value",
-            "units",
-            "sub_sensor_index",
-            "sensor_sn",
-        ] if c in df.columns
-    ]
-
-    if dedupe_cols:
-        df = df.drop_duplicates(subset=dedupe_cols, keep="first")
-    else:
-        df = df.drop_duplicates()
-
     sort_cols = [
         c for c in [
+            "configuration_code",
             "logger_serial_number",
             "port_num",
             "timestamp_utc",
             "datetime",
             "measurement",
-            "units",
+            "sub_sensor_index",
+            "source_file",
         ] if c in df.columns
     ]
 
     if sort_cols:
-        df = df.sort_values(sort_cols)
+        df = df.sort_values(sort_cols, kind="stable")
 
     return df.reset_index(drop=True)
 
@@ -402,6 +400,47 @@ def _measurement_counts(df: pd.DataFrame) -> list[dict[str, Any]]:
         .reset_index(name="rows")
         .to_dict(orient="records")
     )
+
+
+def _load_processing_manifest(
+    manifest_prefix: str,
+    manifest_file: str,
+) -> dict:
+    if not _s3_object_exists(manifest_prefix, manifest_file):
+        return {}
+
+    local = f"_download_{manifest_file}"
+    faasr_get_file(
+        local_file=local,
+        remote_folder=manifest_prefix,
+        remote_file=manifest_file,
+    )
+    with open(local, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _build_source_record(
+    mapping: pd.DataFrame,
+    serial: str,
+) -> dict:
+    selected = mapping[
+        mapping["logger_serial_number"].astype(str) == str(serial)
+    ]
+
+    targets = []
+    for config_code, group in selected.groupby("configuration_code"):
+        targets.append({
+            "configuration_code": str(config_code),
+            "ports": sorted(
+                group["port_num"].dropna().astype(int).unique().tolist()
+            ),
+        })
+
+    return {
+        "serial": serial,
+        "expected_targets": targets,
+        "mapping_version": MAPPING_VERSION,
+    }
 
 
 def _load_existing_source_files(output_prefix: str) -> dict[str, set[str]]:
@@ -506,53 +545,79 @@ def _merge_existing_and_generated(existing_df: pd.DataFrame | None, generated_df
 
 def read_zentra_raw_files(
     raw_prefix: str = "zentra_raw_backfill",
-    staging_prefix: str = "zentra_phase2_staging",
+    staging_prefix: str = "zentra_phase2_staging_manifest_v2",
     max_files_per_serial: str = "ALL",
     output_prefix: str = "zentra_final_12_configs",
     rebuild_mode: str = "incremental",
+    manifest_prefix: str = "zentra_processing_state",
+    manifest_file: str = "processed_raw_manifest.json",
 ):
     """
-    Function 1:
-    Read raw Zentra CSV files from S3 and stage rows by logger.
+    Read raw Zentra CSVs and stage rows by logger.
 
-    Critical correction:
-      The raw data is matched using logger_serial_number + port_num.
-      logger_serial_number is derived from the S3 folder/path or filename, because it is NOT a raw CSV column.
-      port_num comes directly from the raw CSV column.
+    Source of truth:
+      All CSV filenames currently present under
+      zentra_raw_backfill/<serial>/.
 
-    rebuild_mode:
-      - "full": stage all raw files and rebuild the 12 CSVs from scratch.
-      - "incremental": stage only raw source files not already represented
-        in the existing final 12 CSVs.
+    full:
+      Stage every current raw file and rebuild all outputs.
+
+    incremental:
+      Compare the complete current raw filename inventory against the separate
+      processing manifest. Stage only filenames that are not yet processed.
+
+    Deleted raw files:
+      Filenames present in the old manifest but absent from the current S3
+      inventory are recorded. The upload function removes their rows from the
+      final 12 CSVs.
+
+    Mapping changes:
+      Incremental mode refuses to continue when the manifest was created with a
+      different mapping version. Run one full rebuild + overwrite first.
     """
     raw_prefix = raw_prefix.strip().rstrip("/")
     staging_prefix = staging_prefix.strip().rstrip("/")
     output_prefix = output_prefix.strip().rstrip("/")
+    manifest_prefix = manifest_prefix.strip().rstrip("/")
     rebuild_mode = str(rebuild_mode).strip().lower()
 
-    mapping = _mapping_df()
-    serials = sorted(mapping["logger_serial_number"].dropna().astype(str).unique().tolist())
+    if rebuild_mode not in {"full", "incremental"}:
+        raise ValueError("rebuild_mode must be 'full' or 'incremental'.")
 
-    manifest = {
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "raw_prefix": raw_prefix,
-        "staging_prefix": staging_prefix,
-        "output_prefix": output_prefix,
-        "max_files_per_serial": max_files_per_serial,
-        "rebuild_mode": rebuild_mode,
-        "matching_rule": "derived logger_serial_number from S3 path/filename + raw CSV port_num",
-        "serials": {},
-    }
+    mapping = _mapping_df()
+    serials = sorted(
+        mapping["logger_serial_number"].dropna().astype(str).unique().tolist()
+    )
+
+    previous_manifest = _load_processing_manifest(
+        manifest_prefix=manifest_prefix,
+        manifest_file=manifest_file,
+    )
+    previous_processed = previous_manifest.get("processed_files", {})
+    previous_version = previous_manifest.get("mapping_version")
+
+    if (
+        rebuild_mode == "incremental"
+        and previous_processed
+        and previous_version != MAPPING_VERSION
+    ):
+        raise RuntimeError(
+            "The mapping changed. Run one full rebuild with "
+            "rebuild_mode='full' and upload_mode='overwrite' before "
+            "resuming incremental updates."
+        )
 
     mapping_file = "mapping_used.csv"
     mapping.to_csv(mapping_file, index=False)
-    faasr_put_file(local_file=mapping_file, remote_folder=staging_prefix, remote_file=mapping_file)
-
-    existing_sources_by_config = (
-        {code: set() for code in CONFIG_CODES}
-        if rebuild_mode == "full"
-        else _load_existing_source_files(output_prefix)
+    faasr_put_file(
+        local_file=mapping_file,
+        remote_folder=staging_prefix,
+        remote_file=mapping_file,
     )
+
+    current_inventory: dict[str, dict[str, Any]] = {}
+    successfully_staged_sources: list[str] = []
+    serial_summary: dict[str, Any] = {}
 
     for serial in serials:
         raw_folder = f"{raw_prefix}/{serial}"
@@ -563,46 +628,72 @@ def read_zentra_raw_files(
             .tolist()
         )
 
-        raw_files = _list_csv_files(raw_folder, max_files=max_files_per_serial)
+        raw_files = _list_csv_files(
+            raw_folder,
+            max_files=max_files_per_serial,
+        )
+
+        for _, _, source_path in raw_files:
+            current_inventory[source_path] = _build_source_record(
+                mapping=mapping,
+                serial=serial,
+            )
 
         if rebuild_mode == "full":
             needed_raw_files = raw_files
-            skipped_already_processed = []
         else:
-            needed_raw_files = []
-            skipped_already_processed = []
-            for remote_folder, remote_file, source_path in raw_files:
-                if _raw_source_needed_for_serial(
-                    mapping=mapping,
-                    serial=serial,
-                    source_path=source_path,
-                    existing_sources_by_config=existing_sources_by_config,
-                ):
-                    needed_raw_files.append((remote_folder, remote_file, source_path))
-                else:
-                    skipped_already_processed.append(source_path)
-
-        faasr_log(
-            f"{serial}: raw_files={len(raw_files)}, staged={len(needed_raw_files)}, "
-            f"skipped={len(skipped_already_processed)}, allowed_ports={sorted(allowed_ports)}"
-        )
+            needed_raw_files = [
+                item
+                for item in raw_files
+                if item[2] not in previous_processed
+            ]
 
         pieces = []
-        for i, (remote_folder, remote_file, source_path) in enumerate(needed_raw_files):
+        file_details = []
+
+        for i, (remote_folder, remote_file, source_path) in enumerate(
+            needed_raw_files
+        ):
             try:
-                df = _download_csv(remote_folder, remote_file, f"raw_{serial}_{i}.csv")
+                raw_df = _download_csv(
+                    remote_folder,
+                    remote_file,
+                    f"raw_{serial}_{i}.csv",
+                )
                 prepared = _prepare_raw_df(
-                    df=df,
+                    df=raw_df,
                     serial=serial,
                     source_path=source_path,
                     allowed_ports=allowed_ports,
                 )
+
                 if not prepared.empty:
                     pieces.append(prepared)
-            except Exception as exc:
-                faasr_log(f"Skipping unreadable raw file {source_path}: {exc}")
 
-        combined = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+                successfully_staged_sources.append(source_path)
+                file_details.append({
+                    "source_file": source_path,
+                    "raw_rows": int(len(raw_df)),
+                    "rows_after_port_filter": int(len(prepared)),
+                    "rows_by_port": (
+                        prepared.groupby("port_num", dropna=False)
+                        .size()
+                        .reset_index(name="rows")
+                        .to_dict(orient="records")
+                        if not prepared.empty
+                        else []
+                    ),
+                })
+            except Exception as exc:
+                faasr_log(
+                    f"Skipping unreadable raw file {source_path}: {exc}"
+                )
+
+        combined = (
+            pd.concat(pieces, ignore_index=True)
+            if pieces
+            else pd.DataFrame()
+        )
         combined = _dedupe_and_sort(combined)
 
         staged_file = f"{serial}_raw_combined.csv"
@@ -613,18 +704,112 @@ def read_zentra_raw_files(
             remote_file=staged_file,
         )
 
-        manifest["serials"][serial] = {
+        serial_summary[serial] = {
             "allowed_ports_from_mapping": sorted(allowed_ports),
             "raw_files_found": len(raw_files),
             "raw_files_staged": len(needed_raw_files),
-            "raw_files_skipped_already_processed": len(skipped_already_processed),
+            "raw_files_skipped_as_already_processed": (
+                len(raw_files) - len(needed_raw_files)
+            ),
             "staged_rows_after_port_filter": int(len(combined)),
-            "staged_path": f"{staging_prefix}/raw_by_serial/{staged_file}",
+            "staged_file_details": file_details,
             "measurement_counts": _measurement_counts(combined),
         }
 
-    _put_json(manifest, staging_prefix, "raw_manifest.json")
-    faasr_log("Function 1 complete: raw files staged by logger_serial_number and port_num.")
+        faasr_log(
+            f"{serial}: found={len(raw_files)}, "
+            f"staged={len(needed_raw_files)}, "
+            f"rows={len(combined)}, "
+            f"allowed_ports={sorted(allowed_ports)}"
+        )
+
+    current_sources = set(current_inventory)
+    previous_sources = set(previous_processed)
+    deleted_sources = sorted(previous_sources - current_sources)
+
+    if rebuild_mode == "full":
+        candidate_processed = {}
+    else:
+        candidate_processed = {
+            path: details
+            for path, details in previous_processed.items()
+            if path in current_sources
+        }
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    for source_path in successfully_staged_sources:
+        record = current_inventory.get(
+            source_path,
+            {
+                "serial": _extract_serial_from_source_path(source_path),
+                "expected_targets": [],
+            },
+        )
+        candidate_processed[source_path] = {
+            **record,
+            "processed_at_utc": now_utc,
+            "mapping_version": MAPPING_VERSION,
+        }
+
+    # In a full rebuild, every successfully readable current file is committed.
+    if rebuild_mode == "full":
+        candidate_processed = {
+            path: {
+                **current_inventory[path],
+                "processed_at_utc": now_utc,
+                "mapping_version": MAPPING_VERSION,
+            }
+            for path in successfully_staged_sources
+        }
+
+    processing_plan = {
+        "created_at_utc": now_utc,
+        "mapping_version": MAPPING_VERSION,
+        "rebuild_mode": rebuild_mode,
+        "raw_prefix": raw_prefix,
+        "output_prefix": output_prefix,
+        "manifest_prefix": manifest_prefix,
+        "manifest_file": manifest_file,
+        "current_inventory_count": len(current_sources),
+        "previous_processed_count": len(previous_sources),
+        "new_or_reprocessed_sources": sorted(
+            set(successfully_staged_sources)
+        ),
+        "deleted_sources": deleted_sources,
+        "serials": serial_summary,
+    }
+
+    candidate_manifest = {
+        "updated_at_utc": now_utc,
+        "mapping_version": MAPPING_VERSION,
+        "raw_prefix": raw_prefix,
+        "processed_files": candidate_processed,
+    }
+
+    _put_json(
+        processing_plan,
+        staging_prefix,
+        "processing_plan.json",
+    )
+    _put_json(
+        candidate_manifest,
+        staging_prefix,
+        "candidate_processed_manifest.json",
+    )
+    _put_json(
+        {
+            "created_at_utc": now_utc,
+            "mapping_version": MAPPING_VERSION,
+            "serials": serial_summary,
+        },
+        staging_prefix,
+        "raw_manifest.json",
+    )
+
+    faasr_log(
+        "Function 1 complete: current raw filename inventory compared "
+        "against the processing manifest."
+    )
 
 
 def form_12_config_csvs(
@@ -696,10 +881,26 @@ def form_12_config_csvs(
             how="inner",
             validate="many_to_many",
         )
+
+        # z6-19598 port 5 belongs to S_W_D only from 2025-08-21 onward.
+        special_port5 = (
+            (merged_all["configuration_code"] == "S_W_D")
+            & (merged_all["logger_serial_number"] == "z6-19598")
+            & (merged_all["port_num"] == 5)
+        )
+        port5_date_ok = (
+            merged_all["datetime"].notna()
+            & (merged_all["datetime"] >= PORT5_SWD_START_UTC)
+        )
+        merged_all = merged_all[
+            (~special_port5) | port5_date_ok
+        ].copy()
+
         merged_all = _dedupe_and_sort(merged_all)
 
     summary = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "mapping_version": MAPPING_VERSION,
         "generated_prefix": generated_prefix,
         "matching_rule": "exact inner join on logger_serial_number + port_num",
         "total_staged_raw_rows": int(len(all_raw)),
@@ -733,6 +934,14 @@ def form_12_config_csvs(
                 ["logger_name", "logger_serial_number", "port_num", "port_description"]
             ].to_dict(orient="records"),
             "measurement_counts": _measurement_counts(config_df),
+            "source_file_counts": (
+                config_df.groupby(["source_file", "logger_serial_number", "port_num"], dropna=False)
+                .size()
+                .reset_index(name="rows")
+                .to_dict(orient="records")
+                if not config_df.empty
+                else []
+            ),
         }
 
         faasr_log(f"Generated {out_file}: {len(config_df)} rows")
@@ -742,100 +951,204 @@ def form_12_config_csvs(
 
 
 def upload_12_config_csvs(
-    generated_prefix: str = "zentra_phase2_staging/generated_12_configs",
+    generated_prefix: str = (
+        "zentra_phase2_staging_manifest_v2/generated_12_configs"
+    ),
     output_prefix: str = "zentra_final_12_configs",
-    staging_prefix: str = "zentra_phase2_staging",
+    staging_prefix: str = "zentra_phase2_staging_manifest_v2",
     upload_mode: str = "merge",
+    manifest_prefix: str = "zentra_processing_state",
+    manifest_file: str = "processed_raw_manifest.json",
 ):
     """
-    Function 3:
     Upload the generated 12 configuration CSVs.
 
-    upload_mode:
-      - "overwrite": replace final CSVs completely with generated CSVs.
-        Use this when previous final CSVs may be wrong.
-      - "merge": merge generated rows into existing final CSVs.
-        Use this for daily incremental updates after the final CSVs are correct.
+    overwrite:
+      Replace all final files. Use after a mapping change or when existing
+      outputs are not trusted.
+
+    merge:
+      1. Remove rows belonging to raw source files regenerated in this run.
+      2. Remove rows belonging to source files deleted from the raw S3 folder.
+      3. Append the newly generated source rows.
+
+    This makes the workflow idempotent at the raw filename level while
+    preserving every row from each source file.
     """
     generated_prefix = generated_prefix.strip().rstrip("/")
     output_prefix = output_prefix.strip().rstrip("/")
     staging_prefix = staging_prefix.strip().rstrip("/")
+    manifest_prefix = manifest_prefix.strip().rstrip("/")
     upload_mode = str(upload_mode).strip().lower()
+
+    if upload_mode not in {"overwrite", "merge"}:
+        raise ValueError("upload_mode must be 'overwrite' or 'merge'.")
+
+    processing_plan = _load_processing_manifest(
+        staging_prefix,
+        "processing_plan.json",
+    )
+    candidate_manifest = _load_processing_manifest(
+        staging_prefix,
+        "candidate_processed_manifest.json",
+    )
+
+    if not processing_plan or not candidate_manifest:
+        raise RuntimeError(
+            "Missing processing_plan.json or "
+            "candidate_processed_manifest.json in staging."
+        )
+
+    if processing_plan.get("mapping_version") != MAPPING_VERSION:
+        raise RuntimeError(
+            "The staging mapping version does not match the code."
+        )
+
+    regenerated_sources = set(
+        processing_plan.get("new_or_reprocessed_sources", [])
+    )
+    deleted_sources = set(
+        processing_plan.get("deleted_sources", [])
+    )
+    sources_to_remove = regenerated_sources | deleted_sources
 
     upload_summary = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "mapping_version": MAPPING_VERSION,
         "generated_prefix": generated_prefix,
         "output_prefix": output_prefix,
         "upload_mode": upload_mode,
+        "regenerated_sources": sorted(regenerated_sources),
+        "deleted_sources": sorted(deleted_sources),
         "uploaded_files": [],
     }
 
     for config_code in CONFIG_CODES:
         filename = f"{config_code}.csv"
+        generated_df = _download_csv(
+            generated_prefix,
+            filename,
+            f"generated_{filename}",
+        )
 
-        generated_df = _download_csv(generated_prefix, filename, f"generated_{filename}")
-        generated_rows = int(len(generated_df))
+        existing_df = None
+        existing_rows = 0
+
+        if (
+            upload_mode == "merge"
+            and _s3_object_exists(output_prefix, filename)
+        ):
+            existing_df = _download_csv(
+                output_prefix,
+                filename,
+                f"existing_{filename}",
+            )
+            existing_rows = int(len(existing_df))
 
         if upload_mode == "overwrite":
-            final_df = _merge_existing_and_generated(None, generated_df)
-            existing_rows = 0
-            faasr_log(f"Overwrite mode: replacing final {filename} with generated rows only.")
+            final_df = generated_df.copy()
         else:
-            existing_df = None
-            existing_rows = 0
-
-            if _s3_object_exists(output_prefix, filename):
-                try:
-                    existing_df = _download_csv(output_prefix, filename, f"existing_{filename}")
-                    existing_rows = int(len(existing_df))
-                    faasr_log(f"Existing final {filename} found with {existing_rows} rows")
-                except Exception as exc:
-                    faasr_log(f"Could not read existing final {filename}; using generated rows only. Detail: {exc}")
+            if existing_df is None:
+                retained_existing = pd.DataFrame()
             else:
-                faasr_log(f"No existing final {filename}; creating it fresh.")
+                retained_existing = existing_df.copy()
+                if "source_file" not in retained_existing.columns:
+                    retained_existing["source_file"] = pd.NA
 
-            final_df = _merge_existing_and_generated(existing_df, generated_df)
+                if sources_to_remove:
+                    retained_existing = retained_existing[
+                        ~retained_existing["source_file"]
+                        .astype(str)
+                        .isin(sources_to_remove)
+                    ].copy()
 
-        final_rows = int(len(final_df))
+            pieces = [
+                df for df in [retained_existing, generated_df]
+                if df is not None and not df.empty
+            ]
+            final_df = (
+                pd.concat(pieces, ignore_index=True)
+                if pieces
+                else pd.DataFrame(columns=OUTPUT_COLUMNS)
+            )
+
+        for col in OUTPUT_COLUMNS:
+            if col not in final_df.columns:
+                final_df[col] = pd.NA
+
+        # Keep the exact selected output schema. No cross-file row removal.
+        final_df = _dedupe_and_sort(final_df[OUTPUT_COLUMNS])
 
         final_df.to_csv(filename, index=False)
-        faasr_put_file(local_file=filename, remote_folder=output_prefix, remote_file=filename)
+        faasr_put_file(
+            local_file=filename,
+            remote_folder=output_prefix,
+            remote_file=filename,
+        )
 
         upload_summary["uploaded_files"].append({
             "file": filename,
             "existing_rows_before_update": existing_rows,
-            "generated_rows": generated_rows,
-            "final_rows_after_update": final_rows,
-            "rows_added_after_dedupe": max(final_rows - existing_rows, 0),
+            "generated_rows": int(len(generated_df)),
+            "final_rows_after_update": int(len(final_df)),
             "remote_path": f"{output_prefix}/{filename}",
             "measurement_counts": _measurement_counts(final_df),
+            "source_file_counts": (
+                final_df.groupby(
+                    ["source_file", "logger_serial_number", "port_num"],
+                    dropna=False,
+                )
+                .size()
+                .reset_index(name="rows")
+                .to_dict(orient="records")
+                if not final_df.empty
+                else []
+            ),
         })
 
         faasr_log(
-            f"Uploaded final {output_prefix}/{filename}: "
-            f"existing={existing_rows}, generated={generated_rows}, final={final_rows}, mode={upload_mode}"
+            f"Uploaded {filename}: existing={existing_rows}, "
+            f"generated={len(generated_df)}, "
+            f"final={len(final_df)}, mode={upload_mode}"
         )
 
-    try:
-        mapping_df = _download_csv(staging_prefix, "mapping_used.csv", "_mapping_used.csv")
-        mapping_df.to_csv("_mapping_used.csv", index=False)
-        faasr_put_file(local_file="_mapping_used.csv", remote_folder=output_prefix, remote_file="_mapping_used.csv")
-    except Exception as exc:
-        faasr_log(f"Could not publish mapping file: {exc}")
+    mapping_df = _download_csv(
+        staging_prefix,
+        "mapping_used.csv",
+        "_mapping_used.csv",
+    )
+    mapping_df.to_csv("_mapping_used.csv", index=False)
+    faasr_put_file(
+        local_file="_mapping_used.csv",
+        remote_folder=output_prefix,
+        remote_file="_mapping_used.csv",
+    )
 
-    try:
-        faasr_get_file(
-            local_file="_build_summary.json",
-            remote_folder=generated_prefix,
-            remote_file="build_summary.json",
-        )
-        faasr_put_file(
-            local_file="_build_summary.json",
-            remote_folder=output_prefix,
-            remote_file="_build_summary.json",
-        )
-    except Exception as exc:
-        faasr_log(f"Could not publish build summary: {exc}")
+    build_summary = _load_processing_manifest(
+        generated_prefix,
+        "build_summary.json",
+    )
+    _put_json(
+        build_summary,
+        output_prefix,
+        "_build_summary.json",
+    )
+    _put_json(
+        upload_summary,
+        output_prefix,
+        "_upload_summary.json",
+    )
 
-    _put_json(upload_summary, output_prefix, "_upload_summary.json")
-    faasr_log("Function 3 complete: final 12 configuration CSVs uploaded.")
+    # Commit the processed filename manifest only after all 12 outputs succeed.
+    _put_json(
+        candidate_manifest,
+        manifest_prefix,
+        manifest_file,
+    )
+
+    faasr_log(
+        "Function 3 complete: outputs uploaded and processed raw-file "
+        "manifest committed."
+    )
+
+
