@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -812,6 +813,550 @@ def read_zentra_raw_files(
     )
 
 
+
+# ---------------------------------------------------------------------
+# PARALLEL FULL-REBUILD HELPERS
+# ---------------------------------------------------------------------
+#
+# These functions keep raw_by_serial for debugging, but build one logger
+# per FaaSr action so the expensive historical S3 reads happen in parallel.
+#
+# Workflow:
+#   initialize_parallel_raw_build
+#       -> 13 x build_raw_by_serial  (parallel)
+#       -> wait_for_raw_by_serial    (barrier/poller, started in parallel)
+#       -> form_12_config_csvs
+#       -> upload_12_config_csvs
+#
+# The run marker prevents stale completion markers from an older run from
+# being accepted by the barrier.
+#
+
+PARALLEL_SERIALS = [
+    "z6-19600",
+    "z6-12196",
+    "z6-19602",
+    "z6-19604",
+    "z6-19597",
+    "z6-19594",
+    "z6-19599",
+    "z6-12197",
+    "z6-19595",
+    "z6-19598",
+    "z6-12202",
+    "z6-19596",
+    "z6-19603",
+]
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_serial_list(value: Any) -> list[str]:
+    if value is None or str(value).strip().upper() == "ALL":
+        return list(PARALLEL_SERIALS)
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    text_value = str(value).strip()
+    if text_value.startswith("["):
+        parsed = json.loads(text_value)
+        return [str(x).strip() for x in parsed if str(x).strip()]
+    return [x.strip() for x in text_value.split(",") if x.strip()]
+
+
+def initialize_parallel_raw_build(
+    raw_prefix: str = "zentra_raw_backfill",
+    staging_prefix: str = "zentra_phase2_staging_manifest_v2_full_parallel",
+    output_prefix: str = "zentra_final_12_configs",
+    rebuild_mode: str = "full",
+    manifest_prefix: str = "zentra_processing_state",
+    manifest_file: str = "processed_raw_manifest.json",
+):
+    """
+    Initialize a parallel full rebuild.
+
+    This function is intentionally lightweight:
+      1. writes mapping_used.csv once
+      2. writes a unique run marker
+      3. returns, allowing FaaSr to fan out to all logger workers + barrier
+
+    The run marker is essential because raw_by_serial status marker filenames
+    are stable between runs. The barrier accepts only markers whose run_id
+    matches the current run marker.
+    """
+    raw_prefix = raw_prefix.strip().rstrip("/")
+    staging_prefix = staging_prefix.strip().rstrip("/")
+    output_prefix = output_prefix.strip().rstrip("/")
+    manifest_prefix = manifest_prefix.strip().rstrip("/")
+    rebuild_mode = str(rebuild_mode).strip().lower()
+
+    if rebuild_mode != "full":
+        raise ValueError(
+            "initialize_parallel_raw_build is for a full rebuild. "
+            "Use rebuild_mode='full'."
+        )
+
+    mapping = _mapping_df()
+
+    mapping_file = "mapping_used.csv"
+    mapping.to_csv(mapping_file, index=False)
+    faasr_put_file(
+        local_file=mapping_file,
+        remote_folder=staging_prefix,
+        remote_file=mapping_file,
+    )
+
+    now = datetime.now(timezone.utc)
+    run_id = now.strftime("%Y%m%dT%H%M%S%fZ")
+
+    run_marker = {
+        "run_id": run_id,
+        "created_at_utc": now.isoformat(),
+        "mapping_version": MAPPING_VERSION,
+        "raw_prefix": raw_prefix,
+        "staging_prefix": staging_prefix,
+        "output_prefix": output_prefix,
+        "rebuild_mode": rebuild_mode,
+        "manifest_prefix": manifest_prefix,
+        "manifest_file": manifest_file,
+        "expected_serials": PARALLEL_SERIALS,
+    }
+
+    _put_json(
+        run_marker,
+        staging_prefix,
+        "_parallel_run_marker.json",
+    )
+
+    faasr_log(
+        f"Parallel raw build initialized. run_id={run_id}; "
+        f"expected_serials={len(PARALLEL_SERIALS)}"
+    )
+
+
+def build_raw_by_serial(
+    serial_number: str,
+    raw_prefix: str = "zentra_raw_backfill",
+    staging_prefix: str = "zentra_phase2_staging_manifest_v2_full_parallel",
+    max_files_per_serial: str = "ALL",
+    fail_on_unreadable: Any = True,
+):
+    """
+    Build exactly ONE raw_by_serial CSV.
+
+    Each FaaSr action calls this function with a different serial_number.
+    Therefore the 13 expensive historical reads can execute concurrently.
+
+    Output:
+      <staging_prefix>/raw_by_serial/<serial>_raw_combined.csv
+
+    Completion marker:
+      <staging_prefix>/raw_by_serial_status/<serial>.json
+
+    Safety:
+      - completion marker includes current run_id
+      - by default, ANY unreadable raw CSV makes this worker fail
+      - partial results are not accepted by the barrier as success
+    """
+    serial = str(serial_number).strip()
+    raw_prefix = raw_prefix.strip().rstrip("/")
+    staging_prefix = staging_prefix.strip().rstrip("/")
+    fail_on_unreadable = _truthy(fail_on_unreadable)
+
+    if serial not in PARALLEL_SERIALS:
+        raise ValueError(
+            f"Unknown serial_number={serial}. "
+            f"Expected one of {PARALLEL_SERIALS}"
+        )
+
+    run_marker = _load_processing_manifest(
+        staging_prefix,
+        "_parallel_run_marker.json",
+    )
+    if not run_marker:
+        raise RuntimeError(
+            "Missing _parallel_run_marker.json. "
+            "initialize_parallel_raw_build must run first."
+        )
+
+    run_id = str(run_marker.get("run_id", "")).strip()
+    if not run_id:
+        raise RuntimeError("Current parallel run marker has no run_id.")
+
+    if run_marker.get("mapping_version") != MAPPING_VERSION:
+        raise RuntimeError(
+            "Current run marker mapping version does not match code."
+        )
+
+    mapping = _mapping_df()
+    selected_mapping = mapping[
+        mapping["logger_serial_number"].astype(str) == serial
+    ].copy()
+
+    if selected_mapping.empty:
+        raise RuntimeError(f"No mapping rows found for {serial}.")
+
+    allowed_ports = set(
+        selected_mapping["port_num"]
+        .dropna()
+        .astype(int)
+        .tolist()
+    )
+
+    raw_folder = f"{raw_prefix}/{serial}"
+    raw_files = _list_csv_files(
+        raw_folder,
+        max_files=max_files_per_serial,
+    )
+
+    pieces = []
+    file_details = []
+    successfully_staged_sources = []
+    unreadable_files = []
+
+    faasr_log(
+        f"{serial}: starting parallel raw build; "
+        f"raw_files={len(raw_files)}, allowed_ports={sorted(allowed_ports)}, "
+        f"run_id={run_id}"
+    )
+
+    for i, (remote_folder, remote_file, source_path) in enumerate(raw_files):
+        try:
+            raw_df = _download_csv(
+                remote_folder,
+                remote_file,
+                f"raw_{serial}_{i}.csv",
+            )
+            prepared = _prepare_raw_df(
+                df=raw_df,
+                serial=serial,
+                source_path=source_path,
+                allowed_ports=allowed_ports,
+            )
+
+            if not prepared.empty:
+                pieces.append(prepared)
+
+            successfully_staged_sources.append(source_path)
+            file_details.append({
+                "source_file": source_path,
+                "raw_rows": int(len(raw_df)),
+                "rows_after_port_filter": int(len(prepared)),
+                "rows_by_port": (
+                    prepared.groupby("port_num", dropna=False)
+                    .size()
+                    .reset_index(name="rows")
+                    .to_dict(orient="records")
+                    if not prepared.empty
+                    else []
+                ),
+            })
+
+            if (i + 1) % 100 == 0:
+                faasr_log(
+                    f"{serial}: processed {i + 1}/{len(raw_files)} raw files"
+                )
+
+        except Exception as exc:
+            unreadable_files.append({
+                "source_file": source_path,
+                "error": str(exc),
+            })
+            faasr_log(
+                f"{serial}: unreadable raw file {source_path}: {exc}"
+            )
+
+    combined = (
+        pd.concat(pieces, ignore_index=True)
+        if pieces
+        else pd.DataFrame()
+    )
+    combined = _dedupe_and_sort(combined)
+
+    staged_file = f"{serial}_raw_combined.csv"
+    combined.to_csv(staged_file, index=False)
+    faasr_put_file(
+        local_file=staged_file,
+        remote_folder=f"{staging_prefix}/raw_by_serial",
+        remote_file=staged_file,
+    )
+
+    worker_status = "success"
+    if unreadable_files and fail_on_unreadable:
+        worker_status = "failed"
+
+    completion_marker = {
+        "run_id": run_id,
+        "mapping_version": MAPPING_VERSION,
+        "status": worker_status,
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "serial": serial,
+        "raw_folder": raw_folder,
+        "allowed_ports_from_mapping": sorted(allowed_ports),
+        "raw_files_found": len(raw_files),
+        "raw_files_staged_successfully": len(successfully_staged_sources),
+        "unreadable_file_count": len(unreadable_files),
+        "unreadable_files": unreadable_files,
+        "staged_rows_after_port_filter": int(len(combined)),
+        "staged_path": (
+            f"{staging_prefix}/raw_by_serial/{staged_file}"
+        ),
+        "successfully_staged_sources": successfully_staged_sources,
+        "expected_targets": _build_source_record(
+            mapping=mapping,
+            serial=serial,
+        ).get("expected_targets", []),
+        "measurement_counts": _measurement_counts(combined),
+        "file_details": file_details,
+    }
+
+    _put_json(
+        completion_marker,
+        f"{staging_prefix}/raw_by_serial_status",
+        f"{serial}.json",
+    )
+
+    faasr_log(
+        f"{serial}: parallel raw build finished with "
+        f"status={worker_status}; rows={len(combined)}; "
+        f"files_ok={len(successfully_staged_sources)}; "
+        f"files_failed={len(unreadable_files)}"
+    )
+
+    if worker_status != "success":
+        raise RuntimeError(
+            f"{serial}: {len(unreadable_files)} raw file(s) could not be read. "
+            "Worker marked failed; final 12-config build will not proceed."
+        )
+
+
+def wait_for_raw_by_serial(
+    staging_prefix: str = "zentra_phase2_staging_manifest_v2_full_parallel",
+    raw_prefix: str = "zentra_raw_backfill",
+    output_prefix: str = "zentra_final_12_configs",
+    manifest_prefix: str = "zentra_processing_state",
+    manifest_file: str = "processed_raw_manifest.json",
+    expected_serials: Any = "ALL",
+    poll_seconds: int = 30,
+    timeout_seconds: int = 14400,
+):
+    """
+    Barrier for the 13 parallel logger workers.
+
+    It waits until every expected serial has a SUCCESS marker for the CURRENT
+    run_id. Stale markers from prior runs are ignored.
+
+    After all workers succeed, this function creates:
+      processing_plan.json
+      candidate_processed_manifest.json
+      raw_manifest.json
+
+    Those are the same control files expected by upload_12_config_csvs().
+    """
+    staging_prefix = staging_prefix.strip().rstrip("/")
+    raw_prefix = raw_prefix.strip().rstrip("/")
+    output_prefix = output_prefix.strip().rstrip("/")
+    manifest_prefix = manifest_prefix.strip().rstrip("/")
+    expected = _parse_serial_list(expected_serials)
+
+    run_marker = _load_processing_manifest(
+        staging_prefix,
+        "_parallel_run_marker.json",
+    )
+    if not run_marker:
+        raise RuntimeError(
+            "Missing current _parallel_run_marker.json."
+        )
+
+    run_id = str(run_marker.get("run_id", "")).strip()
+    if not run_id:
+        raise RuntimeError("Parallel run marker has no run_id.")
+
+    if run_marker.get("mapping_version") != MAPPING_VERSION:
+        raise RuntimeError(
+            "Run marker mapping version does not match code."
+        )
+
+    started = time.time()
+    last_logged_missing = None
+    markers: dict[str, dict] = {}
+
+    while True:
+        markers = {}
+        missing = []
+        failed = []
+
+        for serial in expected:
+            marker = _load_processing_manifest(
+                f"{staging_prefix}/raw_by_serial_status",
+                f"{serial}.json",
+            )
+
+            if not marker:
+                missing.append(serial)
+                continue
+
+            # Ignore stale completion marker from an older rebuild.
+            if str(marker.get("run_id", "")) != run_id:
+                missing.append(serial)
+                continue
+
+            status = str(marker.get("status", "")).strip().lower()
+            if status == "failed":
+                failed.append(serial)
+                markers[serial] = marker
+                continue
+
+            if status != "success":
+                missing.append(serial)
+                continue
+
+            markers[serial] = marker
+
+        if failed:
+            details = {
+                serial: markers[serial].get("unreadable_files", [])
+                for serial in failed
+            }
+            raise RuntimeError(
+                "Parallel raw build failed for serial(s): "
+                f"{failed}. Details: {details}"
+            )
+
+        if not missing:
+            break
+
+        elapsed = int(time.time() - started)
+        if elapsed >= int(timeout_seconds):
+            raise TimeoutError(
+                "Timed out waiting for parallel raw_by_serial workers. "
+                f"run_id={run_id}; still_missing={missing}; "
+                f"elapsed_seconds={elapsed}"
+            )
+
+        missing_key = tuple(sorted(missing))
+        if missing_key != last_logged_missing:
+            faasr_log(
+                f"Waiting for raw_by_serial workers. "
+                f"run_id={run_id}; complete={len(expected) - len(missing)}/"
+                f"{len(expected)}; missing={missing}"
+            )
+            last_logged_missing = missing_key
+
+        time.sleep(max(5, int(poll_seconds)))
+
+    # All current-run workers succeeded.
+    previous_manifest = _load_processing_manifest(
+        manifest_prefix,
+        manifest_file,
+    )
+    previous_processed = previous_manifest.get("processed_files", {})
+
+    mapping = _mapping_df()
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    successfully_staged_sources = []
+    candidate_processed = {}
+    serial_summary = {}
+
+    for serial in expected:
+        marker = markers[serial]
+        sources = marker.get("successfully_staged_sources", [])
+        successfully_staged_sources.extend(sources)
+
+        serial_summary[serial] = {
+            "allowed_ports_from_mapping": marker.get(
+                "allowed_ports_from_mapping", []
+            ),
+            "raw_files_found": marker.get("raw_files_found", 0),
+            "raw_files_staged": marker.get(
+                "raw_files_staged_successfully", 0
+            ),
+            "unreadable_file_count": marker.get(
+                "unreadable_file_count", 0
+            ),
+            "staged_rows_after_port_filter": marker.get(
+                "staged_rows_after_port_filter", 0
+            ),
+            "staged_path": marker.get("staged_path"),
+            "measurement_counts": marker.get(
+                "measurement_counts", []
+            ),
+        }
+
+        source_record = _build_source_record(
+            mapping=mapping,
+            serial=serial,
+        )
+
+        for source_path in sources:
+            candidate_processed[source_path] = {
+                **source_record,
+                "processed_at_utc": now_utc,
+                "mapping_version": MAPPING_VERSION,
+            }
+
+    current_sources = set(successfully_staged_sources)
+    previous_sources = set(previous_processed)
+    deleted_sources = sorted(previous_sources - current_sources)
+
+    processing_plan = {
+        "created_at_utc": now_utc,
+        "run_id": run_id,
+        "mapping_version": MAPPING_VERSION,
+        "rebuild_mode": "full",
+        "raw_prefix": raw_prefix,
+        "output_prefix": output_prefix,
+        "manifest_prefix": manifest_prefix,
+        "manifest_file": manifest_file,
+        "current_inventory_count": len(current_sources),
+        "previous_processed_count": len(previous_sources),
+        "new_or_reprocessed_sources": sorted(current_sources),
+        "deleted_sources": deleted_sources,
+        "serials": serial_summary,
+        "parallel_workers": len(expected),
+    }
+
+    candidate_manifest = {
+        "updated_at_utc": now_utc,
+        "run_id": run_id,
+        "mapping_version": MAPPING_VERSION,
+        "raw_prefix": raw_prefix,
+        "processed_files": candidate_processed,
+    }
+
+    raw_manifest = {
+        "created_at_utc": now_utc,
+        "run_id": run_id,
+        "mapping_version": MAPPING_VERSION,
+        "parallel_workers": len(expected),
+        "serials": serial_summary,
+    }
+
+    _put_json(
+        processing_plan,
+        staging_prefix,
+        "processing_plan.json",
+    )
+    _put_json(
+        candidate_manifest,
+        staging_prefix,
+        "candidate_processed_manifest.json",
+    )
+    _put_json(
+        raw_manifest,
+        staging_prefix,
+        "raw_manifest.json",
+    )
+
+    faasr_log(
+        f"All {len(expected)} raw_by_serial workers completed successfully "
+        f"for run_id={run_id}. Barrier complete."
+    )
+
 def form_12_config_csvs(
     staging_prefix: str = "zentra_phase2_staging",
     generated_prefix: str = "zentra_phase2_staging/generated_12_configs",
@@ -1150,5 +1695,4 @@ def upload_12_config_csvs(
         "Function 3 complete: outputs uploaded and processed raw-file "
         "manifest committed."
     )
-
 
