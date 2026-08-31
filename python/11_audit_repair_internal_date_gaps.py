@@ -2,7 +2,6 @@ import json
 import re
 import time
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -51,14 +50,6 @@ LOGGER_PORTS = {
     "z6-19596": [2, 3, 4, 5, 6],
     "z6-19603": [2, 3, 4, 5],
 }
-
-
-CONFIG_CODES = [
-    "C_O_N", "C_O_D", "C_O_F",
-    "S_W_N", "S_C_N", "S_E_N",
-    "S_W_D", "S_C_D", "S_E_D",
-    "S_W_F", "S_C_F", "S_E_F",
-]
 
 # Informational only. Internal-gap detection already uses first/last observed
 # dates, so it will never invent gaps before a port actually appears.
@@ -217,72 +208,51 @@ def _safe_int(value: Any) -> int | None:
 # ---------------------------------------------------------------------
 
 
-def _download_final_config_for_audit(
-    final_configs_prefix: str,
-    config_code: str,
+def _load_raw_by_serial_for_audit(
+    raw_by_serial_prefix: str,
+    serial: str,
 ) -> pd.DataFrame:
     """
-    Download one FINAL configuration CSV and read only the columns needed for
-    logger/port/date coverage.
+    Download one combined logger debugging CSV.
 
-    Why use the final 12 CSVs instead of raw_by_serial?
-    --------------------------------------------------
-    The first gap-audit version depended on raw_by_serial. If one combined
-    logger file was blank/zero-column, pandas raised EmptyDataError and the
-    whole audit stopped. The final 12 CSVs are the actual mapped historical
-    dataset that we want to validate, and there are only 12 of them.
-
-    We deliberately fail with a clear CONFIG name if a final CSV itself is
-    empty or malformed, rather than silently treating an unreadable dataset
-    as "no gaps".
+    Only datetime/timestamp_utc/port_num are parsed for the audit, which keeps
+    memory substantially smaller than loading every measurement column.
     """
-    filename = f"{config_code}.csv"
+    filename = f"{serial}_raw_combined.csv"
 
-    if not _exists(final_configs_prefix, filename):
+    if not _exists(raw_by_serial_prefix, filename):
         raise RuntimeError(
-            f"Missing required final configuration CSV: "
-            f"{final_configs_prefix}/{filename}"
+            f"Missing required audit source: "
+            f"{raw_by_serial_prefix}/{filename}. "
+            "Finish the parallel full 12-config build first."
         )
 
-    local = f"_gap_audit_final_{config_code}.csv"
+    local = f"_gap_audit_{serial}.csv"
     faasr_get_file(
         local_file=local,
-        remote_folder=final_configs_prefix,
+        remote_folder=raw_by_serial_prefix,
         remote_file=filename,
     )
 
-    local_path = Path(local)
-    if not local_path.exists() or local_path.stat().st_size == 0:
-        raise RuntimeError(
-            f"{config_code}: downloaded final CSV is zero bytes."
-        )
+    # Callable usecols allows the file to have extra columns without loading
+    # them into memory.
+    df = pd.read_csv(
+        local,
+        usecols=lambda c: c in {
+            "datetime",
+            "timestamp_utc",
+            "port_num",
+        },
+    )
 
-    try:
-        df = pd.read_csv(
-            local,
-            usecols=lambda c: c in {
-                "logger_serial_number",
-                "port_num",
-                "datetime",
-                "timestamp_utc",
-            },
-        )
-    except pd.errors.EmptyDataError as exc:
-        raise RuntimeError(
-            f"{config_code}: final CSV has no parseable columns/data."
-        ) from exc
-
-    required = {"logger_serial_number", "port_num"}
-    missing_required = sorted(required - set(df.columns))
-    if missing_required:
+    if "port_num" not in df.columns:
         raise ValueError(
-            f"{config_code}: final CSV is missing required audit "
-            f"columns {missing_required}."
+            f"{filename} does not contain port_num."
         )
 
     if "datetime" not in df.columns and "timestamp_utc" not in df.columns:
         raise ValueError(
-            f"{config_code}: final CSV has neither datetime nor timestamp_utc."
+            f"{filename} has neither datetime nor timestamp_utc."
         )
 
     return df
@@ -293,10 +263,10 @@ def _local_dates_from_df(
     timezone_name: str,
 ) -> pd.Series:
     """
-    Convert observations to local Oregon calendar dates.
+    Convert raw observations to local calendar dates.
 
-    Prefer datetime. If that field is missing/unparseable, fall back to
-    timestamp_utc interpreted as epoch seconds.
+    Prefer the timezone-aware `datetime` field. Fall back to epoch-seconds
+    `timestamp_utc` when needed.
     """
     timezone_name = str(timezone_name).strip()
 
@@ -326,100 +296,15 @@ def _local_dates_from_df(
     return dt.dt.tz_convert(timezone_name).dt.date
 
 
-def _collect_present_dates_from_final_configs(
-    final_configs_prefix: str,
-    timezone_name: str,
-    serial_numbers: list[str],
-) -> tuple[dict[tuple[str, int], set[date]], dict]:
-    """
-    Scan the 12 final configuration CSVs exactly once and build a compact set
-    of dates observed for each configured (logger, port).
-
-    This is much cheaper and more robust than repeatedly reading thousands of
-    raw S3 files. Duplicates from overlapping raw source files do not matter,
-    because presence is stored as a SET of calendar dates.
-    """
-    selected_serials = set(serial_numbers)
-
-    presence: dict[tuple[str, int], set[date]] = {}
-    for serial in serial_numbers:
-        for port in LOGGER_PORTS[serial]:
-            presence[(serial, int(port))] = set()
-
-    config_summary = {}
-
-    for config_code in CONFIG_CODES:
-        faasr_log(
-            f"Gap audit: reading final configuration {config_code}.csv"
-        )
-        df = _download_final_config_for_audit(
-            final_configs_prefix=final_configs_prefix,
-            config_code=config_code,
-        )
-
-        input_rows = int(len(df))
-        work = df.copy()
-
-        work["logger_serial_number"] = (
-            work["logger_serial_number"].astype(str).str.strip()
-        )
-        work["port_num"] = pd.to_numeric(
-            work["port_num"],
-            errors="coerce",
-        )
-        work["_local_date"] = _local_dates_from_df(
-            work,
-            timezone_name=timezone_name,
-        )
-
-        work = work[
-            work["logger_serial_number"].isin(selected_serials)
-        ].copy()
-        work = work.dropna(
-            subset=["port_num", "_local_date"]
-        )
-
-        used_rows = 0
-
-        for (serial, port_value), group in work.groupby(
-            ["logger_serial_number", "port_num"],
-            dropna=False,
-        ):
-            try:
-                port = int(port_value)
-            except Exception:
-                continue
-
-            key = (str(serial), port)
-            if key not in presence:
-                # Ignore rows outside the configured Orchardgrass logger/port
-                # inventory.
-                continue
-
-            dates = {
-                d for d in group["_local_date"].tolist()
-                if pd.notna(d)
-            }
-            presence[key].update(dates)
-            used_rows += len(group)
-
-        config_summary[config_code] = {
-            "input_rows": input_rows,
-            "rows_used_for_selected_logger_ports": int(used_rows),
-        }
-
-    return presence, config_summary
-
-
 def _missing_runs(
     present_dates: list[date],
 ) -> list[dict[str, Any]]:
     """
-    Return consecutive INTERNAL missing-date runs.
+    Return consecutive internal missing-date runs.
 
-    Only dates strictly between the first and last observed date are considered.
-    This exactly matches the requested definition:
-      data before + no data on date X + data after.
+    By construction only dates strictly between first and last present date
+    can be flagged. Leading/trailing missing dates are intentionally ignored,
+    matching the user's definition of a gap.
     """
     if len(present_dates) < 2:
         return []
@@ -440,6 +325,7 @@ def _missing_runs(
         return []
 
     runs = []
+    run_start = missing[0]
     run_dates = [missing[0]]
 
     for d in missing[1:]:
@@ -447,14 +333,15 @@ def _missing_runs(
             run_dates.append(d)
         else:
             runs.append({
-                "run_start": run_dates[0],
+                "run_start": run_start,
                 "run_end": run_dates[-1],
                 "dates": run_dates,
             })
+            run_start = d
             run_dates = [d]
 
     runs.append({
-        "run_start": run_dates[0],
+        "run_start": run_start,
         "run_end": run_dates[-1],
         "dates": run_dates,
     })
@@ -462,47 +349,76 @@ def _missing_runs(
     return runs
 
 
-def _audit_present_dates(
-    present_dates: set[date],
+def _audit_one_port(
+    df: pd.DataFrame,
     serial: str,
     port: int,
+    timezone_name: str,
 ) -> tuple[list[dict], dict]:
-    present = sorted(set(present_dates))
+    work = df.copy()
+    work["port_num"] = pd.to_numeric(
+        work["port_num"],
+        errors="coerce",
+    )
+    work = work[work["port_num"] == int(port)].copy()
 
-    if not present:
-        # This is NOT an "internal date gap" because there is no before/after
-        # evidence. We surface it separately so it cannot be silently ignored.
+    if work.empty:
+        # No "before and after", so by the user's definition this is not an
+        # internal gap. Report it separately as no observed history.
         return [], {
             "logger_serial_number": serial,
             "port_num": int(port),
             "status": "no_observations_for_configured_port",
-            "effective_start_note": PORT_EFFECTIVE_START_LOCAL.get(
-                (serial, int(port))
-            ),
             "first_present_date": None,
             "last_present_date": None,
             "present_day_count": 0,
             "internal_missing_day_count": 0,
         }
 
-    first_date = present[0]
-    last_date = present[-1]
+    work["_local_date"] = _local_dates_from_df(
+        work,
+        timezone_name=timezone_name,
+    )
+    work = work.dropna(subset=["_local_date"])
+
+    present_dates = sorted(
+        set(work["_local_date"].tolist())
+    )
+
+    if not present_dates:
+        return [], {
+            "logger_serial_number": serial,
+            "port_num": int(port),
+            "status": "no_parseable_dates",
+            "first_present_date": None,
+            "last_present_date": None,
+            "present_day_count": 0,
+            "internal_missing_day_count": 0,
+        }
+
+    first_date = present_dates[0]
+    last_date = present_dates[-1]
 
     rows = []
-    for run in _missing_runs(present):
+    for run in _missing_runs(present_dates):
+        run_dates = run["dates"]
+
         previous_present = max(
-            d for d in present if d < run["run_start"]
+            d for d in present_dates
+            if d < run["run_start"]
         )
         next_present = min(
-            d for d in present if d > run["run_end"]
+            d for d in present_dates
+            if d > run["run_end"]
         )
 
-        for missing_date in run["dates"]:
+        for missing_date in run_dates:
+            gap_id = (
+                f"{serial}|port-{int(port)}|"
+                f"{missing_date.isoformat()}"
+            )
             rows.append({
-                "gap_id": (
-                    f"{serial}|port-{int(port)}|"
-                    f"{missing_date.isoformat()}"
-                ),
+                "gap_id": gap_id,
                 "logger_serial_number": serial,
                 "port_num": int(port),
                 "missing_local_date": missing_date.isoformat(),
@@ -510,12 +426,12 @@ def _audit_present_dates(
                 "next_present_date": next_present.isoformat(),
                 "first_present_date": first_date.isoformat(),
                 "last_present_date": last_date.isoformat(),
-                "consecutive_gap_length": len(run["dates"]),
+                "consecutive_gap_length": len(run_dates),
                 "gap_run_start": run["run_start"].isoformat(),
                 "gap_run_end": run["run_end"].isoformat(),
             })
 
-    return rows, {
+    summary = {
         "logger_serial_number": serial,
         "port_num": int(port),
         "status": "ok",
@@ -524,34 +440,51 @@ def _audit_present_dates(
         ),
         "first_present_date": first_date.isoformat(),
         "last_present_date": last_date.isoformat(),
-        "present_day_count": int(len(present)),
+        "present_day_count": int(len(present_dates)),
         "internal_missing_day_count": int(len(rows)),
     }
+    return rows, summary
 
 
 def audit_internal_date_gaps(
-    final_configs_prefix: str = "zentra_final_12_configs",
+    raw_by_serial_prefix: str = (
+        "zentra_phase2_staging_manifest_v2_full_parallel/"
+        "raw_by_serial"
+    ),
     audit_prefix: str = "zentra_gap_audit",
     timezone_name: str = "America/Los_Angeles",
     serial_numbers: Any = "ALL",
+    fail_on_no_observations: Any = False,
 ):
     """
-    Audit the FINAL 12 configuration CSVs for complete missing local dates.
+    Find FULL local calendar dates that are missing for a logger/port while
+    data exist before AND after the gap.
 
-    Missing-date definition:
-      - same logger + port has observations on at least one earlier date,
-      - zero observations on the target local calendar date,
-      - observations exist again on at least one later date.
+    This intentionally detects only complete missing dates. It does not flag:
+      - partial-day gaps,
+      - missing readings within a day,
+      - leading dates before the first observation,
+      - trailing dates after the last observation.
 
-    Important:
-      - leading/trailing dates are NOT gaps;
-      - partial-day missingness is NOT checked here;
-      - overlapping raw files cannot create a false "present twice" issue,
-        because coverage is reduced to a SET of local dates;
-      - z6-19598 port 5 naturally starts from its first actual observation, so
-        dates before its introduction are not falsely reported as gaps.
+    Audit source:
+      raw_by_serial/<serial>_raw_combined.csv
+
+    This keeps the audit fast: 13 combined logger files are inspected instead
+    of re-downloading thousands of historical raw S3 objects.
     """
     serial_list = _serials(serial_numbers)
+    run_timestamp = datetime.now(timezone.utc).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+
+    fail_on_no_observations_bool = _truthy(
+        fail_on_no_observations
+    )
+
+    all_gap_rows = []
+    port_summaries = []
+    serial_summaries = {}
+    no_observation_ports = []
 
     for serial in serial_list:
         if serial not in LOGGER_PORTS:
@@ -559,58 +492,68 @@ def audit_internal_date_gaps(
                 f"No configured port mapping for {serial}."
             )
 
-    run_timestamp = datetime.now(timezone.utc).strftime(
-        "%Y%m%dT%H%M%SZ"
-    )
-
-    presence, config_summary = (
-        _collect_present_dates_from_final_configs(
-            final_configs_prefix=final_configs_prefix,
-            timezone_name=timezone_name,
-            serial_numbers=serial_list,
+        faasr_log(
+            f"Auditing internal missing dates for {serial}."
         )
-    )
+        df = _load_raw_by_serial_for_audit(
+            raw_by_serial_prefix=raw_by_serial_prefix,
+            serial=serial,
+        )
 
-    all_gap_rows = []
-    port_summaries = []
-    serial_summaries = {}
-
-    no_observation_ports = []
-
-    for serial in serial_list:
         serial_gap_count = 0
         serial_port_summaries = []
 
         for port in LOGGER_PORTS[serial]:
-            gap_rows, port_summary = _audit_present_dates(
-                present_dates=presence[(serial, int(port))],
+            gap_rows, port_summary = _audit_one_port(
+                df=df,
                 serial=serial,
                 port=int(port),
+                timezone_name=timezone_name,
             )
-
-            if port_summary["status"] != "ok":
-                no_observation_ports.append({
-                    "logger_serial_number": serial,
-                    "port_num": int(port),
-                    "status": port_summary["status"],
-                })
-
             all_gap_rows.extend(gap_rows)
             port_summaries.append(port_summary)
             serial_port_summaries.append(port_summary)
             serial_gap_count += len(gap_rows)
 
-            faasr_log(
-                f"Gap audit result: {serial} port {port}: "
-                f"present_days={port_summary['present_day_count']}, "
-                f"internal_missing_days={len(gap_rows)}, "
-                f"status={port_summary['status']}"
-            )
+            if (
+                port_summary.get("status")
+                == "no_observations_for_configured_port"
+            ):
+                no_observation_ports.append(port_summary)
+                faasr_log(
+                    f"WARNING: {serial} port {port} has no observations "
+                    "at all in raw_by_serial. This is NOT an internal-date "
+                    "gap because there is no 'before' and 'after'. "
+                    "It will be reported and skipped."
+                )
+            else:
+                faasr_log(
+                    f"{serial} port {port}: "
+                    f"internal_missing_days={len(gap_rows)}"
+                )
 
         serial_summaries[serial] = {
             "ports": serial_port_summaries,
             "internal_missing_day_count": int(serial_gap_count),
         }
+
+    # A configured port with zero observations is NOT an internal gap under
+    # the user's definition. Report it separately and continue by default.
+    no_obs_df = pd.DataFrame(no_observation_ports)
+    no_obs_file = "no_observation_ports_latest.csv"
+    no_obs_df.to_csv(no_obs_file, index=False)
+    faasr_put_file(
+        local_file=no_obs_file,
+        remote_folder=audit_prefix,
+        remote_file=no_obs_file,
+    )
+
+    if no_observation_ports and fail_on_no_observations_bool:
+        raise RuntimeError(
+            "Gap audit found configured logger/port combinations with no "
+            "observations at all. Strict mode was requested. "
+            f"Details: {no_observation_ports}"
+        )
 
     gap_df = pd.DataFrame(
         all_gap_rows,
@@ -635,39 +578,43 @@ def audit_internal_date_gaps(
         remote_file=timestamped_csv,
     )
 
-    if no_observation_ports:
-        overall_status = "audit_incomplete_configured_ports_with_no_data"
-    elif len(gap_df) > 0:
-        overall_status = "gaps_found"
-    else:
-        overall_status = "no_internal_date_gaps"
-
     plan = {
         "created_at_utc": datetime.now(
             timezone.utc
         ).isoformat(),
-        "status": overall_status,
         "timezone_name": timezone_name,
         "definition": (
             "A gap is a full local calendar date with zero rows for a "
-            "configured logger+port, where observations exist before and "
-            "after that date."
+            "configured logger+port, where at least one observed date exists "
+            "before the gap and at least one observed date exists after it."
         ),
         "scope_note": (
             "Only complete missing local dates are checked. Partial-day "
             "missingness is outside this audit."
         ),
-        "audit_source": "final_12_configuration_csvs",
-        "final_configs_prefix": final_configs_prefix,
+        "raw_by_serial_prefix": raw_by_serial_prefix,
         "audit_prefix": audit_prefix,
         "serial_numbers": serial_list,
         "total_internal_missing_days": int(len(gap_df)),
-        "configured_ports_with_no_observations": no_observation_ports,
         "gaps": all_gap_rows,
         "serials": serial_summaries,
         "ports": port_summaries,
-        "config_files": config_summary,
+        "no_observation_ports": no_observation_ports,
+        "no_observation_port_count": int(len(no_observation_ports)),
+        "no_observation_report_csv": (
+            f"{audit_prefix}/{no_obs_file}"
+        ),
+        "fail_on_no_observations": fail_on_no_observations_bool,
         "plan_csv": f"{audit_prefix}/{plan_csv}",
+        "status": (
+            "gaps_found_with_no_observation_warnings"
+            if len(gap_df) > 0 and no_observation_ports
+            else "gaps_found"
+            if len(gap_df) > 0
+            else "no_internal_gaps_but_no_observation_warnings"
+            if no_observation_ports
+            else "no_internal_date_gaps"
+        ),
     }
 
     _put_json(
@@ -681,16 +628,12 @@ def audit_internal_date_gaps(
         f"internal_gap_plan_{run_timestamp}.json",
     )
 
-    if no_observation_ports:
-        raise RuntimeError(
-            "Gap audit found configured logger/port combinations with NO "
-            "observations at all. This is not an internal-date gap and should "
-            f"be investigated before automatic repair: {no_observation_ports}"
-        )
-
     faasr_log(
         "Internal-date-gap audit complete. "
-        f"total_missing_days={len(gap_df)}"
+        f"total_missing_days={len(gap_df)}, "
+        f"no_observation_warnings={len(no_observation_ports)}. "
+        "No-observation configured ports were skipped because they do not "
+        "satisfy the internal-gap definition."
     )
 
 
