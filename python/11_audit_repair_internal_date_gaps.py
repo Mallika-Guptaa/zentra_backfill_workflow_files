@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import re
 import time
 from datetime import date, datetime, time as dt_time, timedelta, timezone
@@ -208,54 +209,274 @@ def _safe_int(value: Any) -> int | None:
 # ---------------------------------------------------------------------
 
 
+def _empty_audit_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=["datetime", "timestamp_utc", "port_num"]
+    )
+
+
+def _read_minimal_audit_csv(
+    local_path: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Read only date/port columns from a CSV.
+
+    Returns:
+      dataframe, status
+
+    status:
+      ok
+      empty_file
+      no_relevant_columns
+      unreadable
+    """
+    try:
+        if not Path(local_path).exists():
+            return _empty_audit_frame(), "unreadable"
+
+        if Path(local_path).stat().st_size == 0:
+            return _empty_audit_frame(), "empty_file"
+
+        df = pd.read_csv(
+            local_path,
+            usecols=lambda c: c in {
+                "datetime",
+                "timestamp_utc",
+                "port_num",
+            },
+        )
+
+        if df.empty and len(df.columns) == 0:
+            return _empty_audit_frame(), "empty_file"
+
+        if "port_num" not in df.columns:
+            return _empty_audit_frame(), "no_relevant_columns"
+
+        if (
+            "datetime" not in df.columns
+            and "timestamp_utc" not in df.columns
+        ):
+            return _empty_audit_frame(), "no_relevant_columns"
+
+        # Ensure all three audit columns exist so later concatenation is stable.
+        for col in ["datetime", "timestamp_utc", "port_num"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        return (
+            df[["datetime", "timestamp_utc", "port_num"]].copy(),
+            "ok",
+        )
+
+    except pd.errors.EmptyDataError:
+        return _empty_audit_frame(), "empty_file"
+    except Exception as exc:
+        faasr_log(
+            f"Could not parse audit CSV {local_path}: {exc}"
+        )
+        return _empty_audit_frame(), "unreadable"
+
+
+def _list_raw_csv_paths_for_serial(
+    raw_prefix: str,
+    serial: str,
+) -> list[str]:
+    """
+    List raw CSV objects for one logger directly from the raw S3 source folder.
+    Used only as a fallback when raw_by_serial is empty/missing/unreadable.
+    """
+    folder = f"{raw_prefix.strip().rstrip('/')}/{serial}"
+
+    try:
+        objects = _normalize_list_result(
+            faasr_get_folder_list(prefix=folder)
+        )
+    except Exception as exc:
+        faasr_log(
+            f"Could not list fallback raw folder {folder}: {exc}"
+        )
+        return []
+
+    paths = []
+    for obj in objects:
+        s = str(obj).strip().lstrip("/")
+        if not s.lower().endswith(".csv"):
+            continue
+
+        # FaaSr may return full S3 key or a bare filename.
+        if "/" not in s:
+            s = f"{folder}/{s}"
+
+        if s.startswith(folder + "/"):
+            paths.append(s)
+
+    return sorted(set(paths))
+
+
+def _load_raw_s3_fallback_for_audit(
+    raw_prefix: str,
+    serial: str,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Slow but authoritative fallback.
+
+    If the combined raw_by_serial file is empty or unusable, inspect this
+    logger's original raw S3 CSVs so one bad debugging file does not abort or
+    invalidate the historical gap audit.
+    """
+    paths = _list_raw_csv_paths_for_serial(
+        raw_prefix=raw_prefix,
+        serial=serial,
+    )
+
+    pieces = []
+    empty_files = 0
+    unreadable_files = 0
+    no_relevant_columns = 0
+
+    for i, source_path in enumerate(paths):
+        remote_folder, remote_file = _remote_folder_and_file(
+            "",
+            source_path,
+        )
+        local = f"_gap_fallback_{serial}_{i}.csv"
+
+        try:
+            faasr_get_file(
+                local_file=local,
+                remote_folder=remote_folder,
+                remote_file=remote_file,
+            )
+        except Exception as exc:
+            unreadable_files += 1
+            faasr_log(
+                f"Fallback audit could not download "
+                f"{source_path}: {exc}"
+            )
+            continue
+
+        df, status = _read_minimal_audit_csv(local)
+
+        if status == "ok":
+            if not df.empty:
+                pieces.append(df)
+        elif status == "empty_file":
+            empty_files += 1
+        elif status == "no_relevant_columns":
+            no_relevant_columns += 1
+        else:
+            unreadable_files += 1
+
+        if (i + 1) % 100 == 0:
+            faasr_log(
+                f"{serial}: fallback audited "
+                f"{i + 1}/{len(paths)} raw files"
+            )
+
+    combined = (
+        pd.concat(pieces, ignore_index=True)
+        if pieces
+        else _empty_audit_frame()
+    )
+
+    summary = {
+        "fallback_used": True,
+        "raw_files_listed": int(len(paths)),
+        "raw_files_with_usable_rows": int(len(pieces)),
+        "empty_raw_files": int(empty_files),
+        "unreadable_raw_files": int(unreadable_files),
+        "raw_files_without_required_audit_columns": int(
+            no_relevant_columns
+        ),
+        "fallback_rows_loaded": int(len(combined)),
+    }
+
+    return combined, summary
+
+
 def _load_raw_by_serial_for_audit(
     raw_by_serial_prefix: str,
+    raw_prefix: str,
     serial: str,
-) -> pd.DataFrame:
+    fallback_to_raw_s3: Any = True,
+) -> tuple[pd.DataFrame, dict]:
     """
-    Download one combined logger debugging CSV.
+    Preferred audit source:
+      raw_by_serial/<serial>_raw_combined.csv
 
-    Only datetime/timestamp_utc/port_num are parsed for the audit, which keeps
-    memory substantially smaller than loading every measurement column.
+    Robust behavior:
+      - normal combined CSV -> use it directly
+      - zero-byte / headerless / unreadable / missing combined CSV ->
+        optionally fall back to the original raw S3 files for that logger
+      - if both sources contain no usable rows, return an empty audit frame
+        and REPORT the condition instead of crashing the workflow
     """
     filename = f"{serial}_raw_combined.csv"
+    fallback_bool = _truthy(fallback_to_raw_s3)
 
-    if not _exists(raw_by_serial_prefix, filename):
-        raise RuntimeError(
-            f"Missing required audit source: "
-            f"{raw_by_serial_prefix}/{filename}. "
-            "Finish the parallel full 12-config build first."
+    source_summary = {
+        "logger_serial_number": serial,
+        "raw_by_serial_path": (
+            f"{raw_by_serial_prefix.rstrip('/')}/{filename}"
+        ),
+        "raw_by_serial_status": None,
+        "fallback_used": False,
+    }
+
+    if _exists(raw_by_serial_prefix, filename):
+        local = f"_gap_audit_{serial}.csv"
+
+        try:
+            faasr_get_file(
+                local_file=local,
+                remote_folder=raw_by_serial_prefix,
+                remote_file=filename,
+            )
+            df, read_status = _read_minimal_audit_csv(local)
+        except Exception as exc:
+            df = _empty_audit_frame()
+            read_status = "download_failed"
+            source_summary["raw_by_serial_error"] = str(exc)
+
+        source_summary["raw_by_serial_status"] = read_status
+        source_summary["raw_by_serial_rows_loaded"] = int(
+            len(df)
         )
 
-    local = f"_gap_audit_{serial}.csv"
-    faasr_get_file(
-        local_file=local,
-        remote_folder=raw_by_serial_prefix,
-        remote_file=filename,
-    )
+        if read_status == "ok" and not df.empty:
+            source_summary["audit_source"] = "raw_by_serial"
+            return df, source_summary
 
-    # Callable usecols allows the file to have extra columns without loading
-    # them into memory.
-    df = pd.read_csv(
-        local,
-        usecols=lambda c: c in {
-            "datetime",
-            "timestamp_utc",
-            "port_num",
-        },
-    )
-
-    if "port_num" not in df.columns:
-        raise ValueError(
-            f"{filename} does not contain port_num."
+        faasr_log(
+            f"WARNING: {serial} raw_by_serial file is "
+            f"{read_status} / rows={len(df)}."
         )
 
-    if "datetime" not in df.columns and "timestamp_utc" not in df.columns:
-        raise ValueError(
-            f"{filename} has neither datetime nor timestamp_utc."
+    else:
+        source_summary["raw_by_serial_status"] = "missing"
+        faasr_log(
+            f"WARNING: {serial} raw_by_serial file is missing."
         )
 
-    return df
+    if fallback_bool:
+        faasr_log(
+            f"{serial}: falling back to original raw S3 files "
+            "for the gap audit."
+        )
+        fallback_df, fallback_summary = (
+            _load_raw_s3_fallback_for_audit(
+                raw_prefix=raw_prefix,
+                serial=serial,
+            )
+        )
+        source_summary.update(fallback_summary)
+
+        if not fallback_df.empty:
+            source_summary["audit_source"] = "raw_s3_fallback"
+            return fallback_df, source_summary
+
+    source_summary["audit_source"] = "no_usable_source_rows"
+    return _empty_audit_frame(), source_summary
 
 
 def _local_dates_from_df(
@@ -451,10 +672,12 @@ def audit_internal_date_gaps(
         "zentra_phase2_staging_manifest_v2_full_parallel/"
         "raw_by_serial"
     ),
+    raw_prefix: str = "zentra_raw_backfill",
     audit_prefix: str = "zentra_gap_audit",
     timezone_name: str = "America/Los_Angeles",
     serial_numbers: Any = "ALL",
     fail_on_no_observations: Any = False,
+    fallback_to_raw_s3: Any = True,
 ):
     """
     Find FULL local calendar dates that are missing for a logger/port while
@@ -485,6 +708,7 @@ def audit_internal_date_gaps(
     port_summaries = []
     serial_summaries = {}
     no_observation_ports = []
+    audit_source_summaries = []
 
     for serial in serial_list:
         if serial not in LOGGER_PORTS:
@@ -495,9 +719,18 @@ def audit_internal_date_gaps(
         faasr_log(
             f"Auditing internal missing dates for {serial}."
         )
-        df = _load_raw_by_serial_for_audit(
+        df, source_summary = _load_raw_by_serial_for_audit(
             raw_by_serial_prefix=raw_by_serial_prefix,
+            raw_prefix=raw_prefix,
             serial=serial,
+            fallback_to_raw_s3=fallback_to_raw_s3,
+        )
+        audit_source_summaries.append(source_summary)
+
+        faasr_log(
+            f"{serial}: audit_source="
+            f"{source_summary.get('audit_source')}; "
+            f"rows={len(df)}"
         )
 
         serial_gap_count = 0
@@ -533,9 +766,19 @@ def audit_internal_date_gaps(
                 )
 
         serial_summaries[serial] = {
+            "audit_source": source_summary,
             "ports": serial_port_summaries,
             "internal_missing_day_count": int(serial_gap_count),
         }
+
+    audit_source_df = pd.DataFrame(audit_source_summaries)
+    audit_source_file = "audit_source_status_latest.csv"
+    audit_source_df.to_csv(audit_source_file, index=False)
+    faasr_put_file(
+        local_file=audit_source_file,
+        remote_folder=audit_prefix,
+        remote_file=audit_source_file,
+    )
 
     # A configured port with zero observations is NOT an internal gap under
     # the user's definition. Report it separately and continue by default.
@@ -593,7 +836,13 @@ def audit_internal_date_gaps(
             "missingness is outside this audit."
         ),
         "raw_by_serial_prefix": raw_by_serial_prefix,
+        "raw_prefix": raw_prefix,
+        "fallback_to_raw_s3": _truthy(fallback_to_raw_s3),
         "audit_prefix": audit_prefix,
+        "audit_source_summaries": audit_source_summaries,
+        "audit_source_report_csv": (
+            f"{audit_prefix}/{audit_source_file}"
+        ),
         "serial_numbers": serial_list,
         "total_internal_missing_days": int(len(gap_df)),
         "gaps": all_gap_rows,
