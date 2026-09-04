@@ -150,6 +150,37 @@ def _standardize(
         work["port_num"], errors="coerce"
     ).astype("Int64")
 
+    # Normalize fields used in duplicate comparison.  The final 12-config
+    # files intentionally preserve overlapping source rows, so monthly
+    # processing removes a row ONLY when the actual observation contents
+    # match, including Value and Units.
+    work["logger_serial_number"] = (
+        work["logger_serial_number"].astype("string").str.strip()
+    )
+    work["measurement"] = (
+        work["measurement"].astype("string").str.strip()
+    )
+    work["Units"] = work["Units"].astype("string").str.strip()
+
+    if "sensor_sn" in work.columns:
+        work["sensor_sn"] = work["sensor_sn"].astype("string").str.strip()
+    if "mrid" in work.columns:
+        # Normalize 95294, 95294.0 and "95294" to the same comparable form.
+        mrid_num = pd.to_numeric(work["mrid"], errors="coerce")
+        work["_mrid_key"] = work["mrid"].astype("string").str.strip()
+        integer_mask = mrid_num.notna() & ((mrid_num % 1) == 0)
+        work.loc[integer_mask, "_mrid_key"] = (
+            mrid_num.loc[integer_mask].astype("Int64").astype("string")
+        )
+    if "sub_sensor_index" in work.columns:
+        work["sub_sensor_index"] = pd.to_numeric(
+            work["sub_sensor_index"], errors="coerce"
+        ).astype("Int64")
+    if "timestamp_utc" in work.columns:
+        work["timestamp_utc"] = pd.to_numeric(
+            work["timestamp_utc"], errors="coerce"
+        )
+
     work["_dt_utc"] = pd.to_datetime(
         work["datetime"], errors="coerce", utc=True
     )
@@ -176,82 +207,159 @@ def _standardize(
     return work, qa
 
 
-def _event_identity_columns(df: pd.DataFrame) -> list[str]:
+def _event_identity_columns(
+    df: pd.DataFrame,
+    include_value_and_units: bool = True,
+) -> list[str]:
     """
-    Logical sensor-event identity deliberately excludes source_file and value.
+    Columns used to decide whether two rows are duplicates.
+
+    IMPORTANT:
+    source_file is deliberately excluded because the same Zentra observation
+    can legitimately appear in multiple overlapping raw source files.
+
+    A row is removed as a duplicate ONLY when all available observation
+    identity fields match.  In exact-duplicate mode, Value and Units MUST also
+    match. Therefore:
+      - same sensor/time but different measurement -> both kept
+      - same sensor/time/measurement but different Value -> both kept
+      - same sensor/time/measurement/value but different Units -> both kept
+      - same observation including Value + Units, different source_file -> one kept
     """
     candidates = [
         "logger_serial_number",
         "port_num",
+        "_mrid_key",
         "timestamp_utc",
-        "datetime",
+        "_dt_utc",
         "measurement",
-        "Units",
         "sub_sensor_index",
         "sensor_sn",
     ]
+
+    if include_value_and_units:
+        candidates.extend(["Value", "Units"])
+
     cols = [c for c in candidates if c in df.columns]
+
     if "logger_serial_number" not in cols or "port_num" not in cols:
         raise ValueError("Cannot construct logical event identity.")
+    if "measurement" not in cols:
+        raise ValueError("Cannot construct duplicate identity without measurement.")
+    if include_value_and_units:
+        if "Value" not in cols or "Units" not in cols:
+            raise ValueError(
+                "Exact duplicate comparison requires both Value and Units."
+            )
+
     return cols
 
 
 def _dedupe_events(
     df: pd.DataFrame,
-    conflict_policy: str,
+    conflict_policy: str = "keep_distinct",
 ) -> tuple[pd.DataFrame, dict]:
+    """
+    Remove ONLY exact duplicate observations.
+
+    The old implementation treated rows sharing the same sensor-event identity
+    but having different Values as a conflict and could stop the workflow.
+    That is no longer done.
+
+    Value and Units are now part of the duplicate definition. If either differs,
+    the rows are considered distinct observations and BOTH are retained.
+
+    conflict_policy is retained only for compatibility with older FaaSr JSONs.
+    Values such as "fail" or "exclude" no longer cause distinct-value rows to
+    be removed or to fail the workflow.
+    """
     if df.empty:
         return df.copy(), {
+            "duplicate_definition": (
+                "all available event fields + measurement + Value + Units; "
+                "source_file excluded"
+            ),
             "duplicate_rows_removed": 0,
+            "exact_duplicate_groups": 0,
+            "same_base_event_different_value_groups_kept": 0,
+            "same_base_event_different_units_groups_kept": 0,
             "conflicting_event_groups": 0,
         }
 
-    conflict_policy = str(conflict_policy).strip().lower()
-    if conflict_policy not in {"fail", "exclude"}:
-        raise ValueError("conflict_policy must be 'fail' or 'exclude'.")
-
-    identity = _event_identity_columns(df)
-    grouped = (
-        df.groupby(identity, dropna=False)["Value"]
-        .nunique(dropna=False)
-        .reset_index(name="_value_count")
-    )
-    conflicts = grouped[grouped["_value_count"] > 1].copy()
-    conflict_count = len(conflicts)
+    policy = str(conflict_policy).strip().lower()
+    if policy in {"fail", "exclude"}:
+        faasr_log(
+            f"Legacy conflict_policy='{policy}' received. "
+            "Exact-duplicate mode keeps rows with different Value or Units; "
+            "the legacy conflict action is not applied."
+        )
 
     work = df.copy()
 
-    if conflict_count:
-        if conflict_policy == "fail":
-            sample = conflicts.head(10).to_dict(orient="records")
-            raise RuntimeError(
-                f"Found {conflict_count} logical sensor events with "
-                f"conflicting values. Sample: {sample}"
-            )
+    # Base identity is useful only for QA: it tells us how many same-sensor/time
+    # groups contain multiple values or multiple units.  Those rows are KEPT.
+    base_identity = _event_identity_columns(
+        work,
+        include_value_and_units=False,
+    )
+    variant_summary = (
+        work.groupby(base_identity, dropna=False)
+        .agg(
+            _distinct_values=("Value", lambda s: s.nunique(dropna=False)),
+            _distinct_units=("Units", lambda s: s.nunique(dropna=False)),
+        )
+        .reset_index()
+    )
+    different_value_groups = int(
+        (variant_summary["_distinct_values"] > 1).sum()
+    )
+    different_unit_groups = int(
+        (variant_summary["_distinct_units"] > 1).sum()
+    )
 
-        # Exclude every conflicting logical event.
-        conflict_keys = conflicts[identity].copy()
-        conflict_keys["_conflict"] = True
-        work = work.merge(
-            conflict_keys,
-            on=identity,
-            how="left",
+    # Exact duplicate identity includes BOTH Value and Units.
+    exact_identity = _event_identity_columns(
+        work,
+        include_value_and_units=True,
+    )
+
+    duplicate_mask = work.duplicated(
+        subset=exact_identity,
+        keep=False,
+    )
+    if duplicate_mask.any():
+        exact_duplicate_groups = int(
+            work.loc[duplicate_mask]
+            .groupby(exact_identity, dropna=False)
+            .ngroups
         )
-        work = work[work["_conflict"].isna()].drop(
-            columns=["_conflict"]
-        )
+    else:
+        exact_duplicate_groups = 0
 
     before = len(work)
-    # Identical logical events from overlapping source files collapse here.
     work = work.drop_duplicates(
-        subset=identity + ["Value"],
+        subset=exact_identity,
         keep="first",
     ).copy()
     duplicate_removed = before - len(work)
 
     return work, {
+        "duplicate_definition": (
+            "logger/port + available MRID/time/sensor fields + "
+            "measurement + Value + Units; source_file excluded"
+        ),
         "duplicate_rows_removed": int(duplicate_removed),
-        "conflicting_event_groups": int(conflict_count),
+        "exact_duplicate_groups": int(exact_duplicate_groups),
+        "same_base_event_different_value_groups_kept": (
+            different_value_groups
+        ),
+        "same_base_event_different_units_groups_kept": (
+            different_unit_groups
+        ),
+        # Kept for backward-compatible summaries. Distinct values are no longer
+        # classified as conflicts under the user's requested definition.
+        "conflicting_event_groups": 0,
+        "legacy_conflict_policy_received": policy,
     }
 
 
@@ -385,11 +493,16 @@ def build_monthly_averages(
     timezone_name: str = "America/Los_Angeles",
     average_method: str = "daily_mean",
     exclude_error_rows: Any = True,
-    conflict_policy: str = "fail",
+    conflict_policy: str = "keep_distinct",
     minimum_day_coverage_ratio: float = 0.8,
 ):
     """
     Safe full monthly rebuild.
+
+    The final 12-config CSVs are intentionally source-preserving. Before any
+    averaging, this function removes only exact duplicate observations where
+    all available event-identifying fields AND measurement, Value, and Units
+    match. Rows with a different Value, Units, or measurement are retained.
 
     All 12 outputs are computed and validated locally first. Existing production
     monthly files are NOT overwritten with empty/error outputs on failure.
@@ -461,6 +574,11 @@ def build_monthly_averages(
         "average_method": average_method,
         "exclude_error_rows": exclude_error_rows,
         "conflict_policy": conflict_policy,
+        "duplicate_policy": "exact_observation_value_units",
+        "duplicate_rule": (
+            "Remove only rows matching all available event identity fields "
+            "plus measurement, Value and Units; ignore source_file."
+        ),
         "minimum_day_coverage_ratio": float(
             minimum_day_coverage_ratio
         ),
@@ -482,7 +600,7 @@ def update_monthly_averages_incremental(
     timezone_name: str = "America/Los_Angeles",
     average_method: str = "daily_mean",
     exclude_error_rows: Any = True,
-    conflict_policy: str = "fail",
+    conflict_policy: str = "keep_distinct",
     minimum_day_coverage_ratio: float = 0.8,
 ):
     """
@@ -515,6 +633,7 @@ def update_monthly_averages_incremental(
         "mode": "incremental",
         "daily_12_summary_status": update_info.get("status"),
         "affected_months_by_config": affected,
+        "duplicate_policy": "exact_observation_value_units",
         "configs": {},
     }
 
