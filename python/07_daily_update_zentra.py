@@ -293,16 +293,19 @@ def fetch_daily_zentra_raw(
     ports: str = "AUTO",
 ):
     """
-    Daily incremental fetch for all Zentra loggers.
+    Fault-tolerant daily fetch.
 
-    Output:
-      zentra_raw_backfill/<serial>/daily_<serial>_<ports>_<start>_to_<end>.csv
+    Every logger is attempted even if another logger fails.
+    State advances only for successful loggers.
+
+    Outputs:
+      zentra_raw_backfill/<serial>/daily_....csv
       zentra_daily_update_state/daily_update_state_<serial>.json
       zentra_daily_update_state/daily_update_summary_latest.json
+      zentra_daily_update_state/daily_update_summary_<timestamp>.json
 
-    This function only fetches latest raw data and saves it into the same raw
-    backfill folder used by Phase 2. The next Phase 2 steps update the 12 final
-    configuration CSVs incrementally.
+    The downstream 12-config updater consumes ONLY remote_path values from this
+    summary; it does not scan historical S3 data.
     """
     token = faasr_secret("ZENTRA_TOKEN")
     serial_list = _serials(serial_numbers)
@@ -315,6 +318,9 @@ def fetch_daily_zentra_raw(
         "lookback_hours": int(lookback_hours),
         "buffer_hours": int(buffer_hours),
         "serials": {},
+        "successful_serials": [],
+        "failed_serials": [],
+        "status": "running",
     }
 
     for serial_idx, serial in enumerate(serial_list):
@@ -322,101 +328,161 @@ def fetch_daily_zentra_raw(
             time.sleep(int(sleep_between_serials))
 
         selected_ports = _ports_for_serial(serial, ports)
-        start_dt, state = _window_for_serial(
-            serial=serial,
-            end_dt=end_dt,
-            lookback_hours=int(lookback_hours),
-            state_prefix=state_prefix,
-            buffer_hours=int(buffer_hours),
+
+        try:
+            start_dt, state = _window_for_serial(
+                serial=serial,
+                end_dt=end_dt,
+                lookback_hours=int(lookback_hours),
+                state_prefix=state_prefix,
+                buffer_hours=int(buffer_hours),
+            )
+
+            start_s = _zentra_dt(start_dt)
+            end_s = _zentra_dt(end_dt)
+
+            pages = []
+            raw_rows = 0
+            saved_rows = 0
+            api_calls = 0
+            page_num = 1
+
+            while True:
+                if page_num > 1:
+                    faasr_log(
+                        f"{serial}: sleeping {sleep_seconds}s before next page."
+                    )
+                    time.sleep(int(sleep_seconds))
+
+                faasr_log(
+                    f"Fetching daily update for {serial}: "
+                    f"{start_s} to {end_s}, page={page_num}, "
+                    f"ports={selected_ports if selected_ports is not None else 'ALL'}"
+                )
+
+                df_raw = _fetch_page_retry(
+                    token=token,
+                    serial=serial,
+                    start_s=start_s,
+                    end_s=end_s,
+                    page_num=page_num,
+                    per_page=int(per_page),
+                    api_version=api_version,
+                    server=server,
+                    sleep_seconds=int(sleep_seconds),
+                )
+                api_calls += 1
+                raw_rows += len(df_raw)
+
+                df_filtered = _filter_to_ports(
+                    df_raw,
+                    serial,
+                    selected_ports,
+                )
+                saved_rows += len(df_filtered)
+
+                if not df_filtered.empty:
+                    pages.append(df_filtered)
+
+                if len(df_raw) < int(per_page):
+                    break
+
+                page_num += 1
+
+            df_out = (
+                pd.concat(pages, ignore_index=True)
+                if pages
+                else pd.DataFrame()
+            )
+
+            remote_path = None
+            if not df_out.empty:
+                remote_path = _upload_daily_csv(
+                    df=df_out,
+                    raw_prefix=raw_prefix,
+                    serial=serial,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    selected_ports=selected_ports,
+                )
+                faasr_log(
+                    f"{serial}: uploaded {len(df_out)} rows to {remote_path}"
+                )
+            else:
+                faasr_log(
+                    f"{serial}: no rows for selected ports in daily window."
+                )
+
+            # Advance state only after this logger completed successfully.
+            state.update({
+                "serial": serial,
+                "last_successful_start_utc": start_dt.isoformat(),
+                "last_successful_end_utc": end_dt.isoformat(),
+                "last_raw_rows_downloaded_from_api": int(raw_rows),
+                "last_rows_saved_after_port_filter": int(saved_rows),
+                "last_api_calls": int(api_calls),
+                "last_remote_path": remote_path,
+                "selected_ports": selected_ports,
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            })
+            _upload_json(
+                state,
+                state_prefix,
+                f"daily_update_state_{serial}.json",
+            )
+
+            summary["serials"][serial] = {
+                "status": "success",
+                "start_utc": start_dt.isoformat(),
+                "end_utc": end_dt.isoformat(),
+                "raw_rows_downloaded_from_api": int(raw_rows),
+                "rows_saved_after_port_filter": int(saved_rows),
+                "api_calls": int(api_calls),
+                "remote_path": remote_path,
+                "selected_ports": selected_ports,
+            }
+            summary["successful_serials"].append(serial)
+
+        except Exception as exc:
+            # Do not advance this logger's state. The next run will catch up
+            # from its previous last_successful_end_utc.
+            faasr_log(f"{serial}: DAILY FETCH FAILED: {exc}")
+            summary["serials"][serial] = {
+                "status": "failed",
+                "error": str(exc),
+                "selected_ports": selected_ports,
+                "remote_path": None,
+            }
+            summary["failed_serials"].append(serial)
+
+    if summary["failed_serials"]:
+        summary["status"] = (
+            "partial_success"
+            if summary["successful_serials"]
+            else "failed"
+        )
+    else:
+        summary["status"] = "success"
+
+    _upload_json(
+        summary,
+        state_prefix,
+        "daily_update_summary_latest.json",
+    )
+    timestamped_summary = (
+        f"daily_update_summary_{_stamp(end_dt)}.json"
+    )
+    _upload_json(summary, state_prefix, timestamped_summary)
+
+    faasr_log(
+        f"Daily Zentra raw update complete. status={summary['status']}; "
+        f"success={len(summary['successful_serials'])}; "
+        f"failed={len(summary['failed_serials'])}"
+    )
+
+    if not summary["successful_serials"]:
+        raise RuntimeError(
+            "Daily Zentra fetch failed for every logger. "
+            "No downstream update should run."
         )
 
-        start_s = _zentra_dt(start_dt)
-        end_s = _zentra_dt(end_dt)
-
-        pages = []
-        raw_rows = 0
-        saved_rows = 0
-        api_calls = 0
-        page_num = 1
-
-        while True:
-            if page_num > 1:
-                faasr_log(f"{serial}: sleeping {sleep_seconds}s before next page for same device.")
-                time.sleep(int(sleep_seconds))
-
-            faasr_log(
-                f"Fetching daily update for {serial}: {start_s} to {end_s}, page={page_num}, "
-                f"ports={selected_ports if selected_ports is not None else 'ALL'}"
-            )
-
-            df_raw = _fetch_page_retry(
-                token=token,
-                serial=serial,
-                start_s=start_s,
-                end_s=end_s,
-                page_num=page_num,
-                per_page=int(per_page),
-                api_version=api_version,
-                server=server,
-                sleep_seconds=int(sleep_seconds),
-            )
-            api_calls += 1
-            raw_rows += len(df_raw)
-
-            df_filtered = _filter_to_ports(df_raw, serial, selected_ports)
-            saved_rows += len(df_filtered)
-
-            if not df_filtered.empty:
-                pages.append(df_filtered)
-
-            if len(df_raw) < int(per_page):
-                break
-
-            page_num += 1
-
-        if pages:
-            df_out = pd.concat(pages, ignore_index=True)
-        else:
-            df_out = pd.DataFrame()
-
-        remote_path = None
-        if not df_out.empty:
-            remote_path = _upload_daily_csv(
-                df=df_out,
-                raw_prefix=raw_prefix,
-                serial=serial,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                selected_ports=selected_ports,
-            )
-            faasr_log(f"{serial}: uploaded {len(df_out)} rows to {remote_path}")
-        else:
-            faasr_log(f"{serial}: no rows for selected ports in daily update window.")
-
-        state.update({
-            "serial": serial,
-            "last_successful_start_utc": start_dt.isoformat(),
-            "last_successful_end_utc": end_dt.isoformat(),
-            "last_raw_rows_downloaded_from_api": int(raw_rows),
-            "last_rows_saved_after_port_filter": int(saved_rows),
-            "last_api_calls": int(api_calls),
-            "last_remote_path": remote_path,
-            "selected_ports": selected_ports,
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        })
-        _upload_json(state, state_prefix, f"daily_update_state_{serial}.json")
-
-        summary["serials"][serial] = {
-            "start_utc": start_dt.isoformat(),
-            "end_utc": end_dt.isoformat(),
-            "raw_rows_downloaded_from_api": int(raw_rows),
-            "rows_saved_after_port_filter": int(saved_rows),
-            "api_calls": int(api_calls),
-            "remote_path": remote_path,
-            "selected_ports": selected_ports,
-        }
-
-    _upload_json(summary, state_prefix, "daily_update_summary_latest.json")
-    timestamped_summary = f"daily_update_summary_{_stamp(end_dt)}.json"
-    _upload_json(summary, state_prefix, timestamped_summary)
-    faasr_log("Daily Zentra raw update complete.")
